@@ -1,4 +1,4 @@
-name = name = "monster-live-feed-0abd"
+name = name = name = "monster-live-feed-0abd"
 main = "worker.js"
 compatibility_date = "2026-09-11"
 workers_dev = true
