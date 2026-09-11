@@ -317,28 +317,29 @@ async function recentSwapPoolCounts(env, blocksBack = 2400) {
   const latestHex = await rpc(env, "eth_blockNumber");
   const latest = hexToNumber(latestHex);
 
-  const requested = Math.min(Math.max(Number(blocksBack) || 2400, 100), 4800);
+  const requested = Math.min(Math.max(Number(blocksBack) || 100, 10), 200);
   const first = Math.max(0, latest - requested + 1);
 
-  const chunkSize = 600;
+  const chunkSize = 10;
   const ranges = [];
   for (let start = first; start <= latest; start += chunkSize) {
     ranges.push([start, Math.min(start + chunkSize - 1, latest)]);
   }
 
-  const allLogs = [];
+  const batches = await Promise.all(
+    ranges.map(async ([fromBlock, toBlock]) => {
+      const logs = await rpc(env, "eth_getLogs", [
+        {
+          fromBlock: toHex(fromBlock),
+          toBlock: toHex(toBlock),
+          topics: [[V2_SWAP_TOPIC, V3_SWAP_TOPIC]],
+        },
+      ]);
+      return Array.isArray(logs) ? logs : [];
+    })
+  );
 
-  for (const [fromBlock, toBlock] of ranges) {
-    const logs = await rpc(env, "eth_getLogs", [
-      {
-        fromBlock: toHex(fromBlock),
-        toBlock: toHex(toBlock),
-        topics: [[V2_SWAP_TOPIC, V3_SWAP_TOPIC]],
-      },
-    ]);
-
-    if (Array.isArray(logs)) allLogs.push(...logs);
-  }
+  const allLogs = batches.flat();
 
   const pools = new Map();
 
@@ -376,8 +377,8 @@ async function recentSwapPoolCounts(env, blocksBack = 2400) {
 
 async function scanMomentum(env, url) {
   const blocks = Math.min(
-    Math.max(Number(url.searchParams.get("blocks") || 2400), 100),
-    4800
+    Math.max(Number(url.searchParams.get("blocks") || 100), 10),
+    200
   );
   const limit = Math.min(
     Math.max(Number(url.searchParams.get("limit") || 12), 1),
@@ -466,7 +467,7 @@ async function scanMomentum(env, url) {
     candidates,
     checkedAt: new Date().toISOString(),
     notes: [
-      "Discovery is based on recent Uniswap-V2-style and canonical Uniswap-V3 Swap event signatures observed directly through the Robinhood Chain RPC.",
+      "Discovery is based on the most recent Robinhood Chain blocks and canonical V2/V3 Swap event signatures. On Alchemy Free, log queries are automatically split into 10-block batches.",
       "DEX Screener is used only to enrich discovered Robinhood pools with price/liquidity/volume/transaction windows.",
       "This is a momentum discovery feed, not a trade approval. Security, executable quote/slippage, contract risk, and structure still require Monster Trading validation.",
     ],
@@ -513,7 +514,7 @@ export default {
           checkedAt: new Date().toISOString(),
           endpoints: {
             health: "/health",
-            scan: "/scan?blocks=2400&limit=12&minLiquidity=1000",
+            scan: "/scan?blocks=100&limit=12&minLiquidity=1000&sizeUsd=200",
             token: "/token/0x...",
             market: "/market/0x...",
             snapshot: "/snapshot/0x...?sizeUsd=200",
