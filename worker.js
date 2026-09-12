@@ -6,6 +6,26 @@ const V2_SWAP_TOPIC =
 const V3_SWAP_TOPIC =
   "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
 
+const V2_BURN_TOPIC =
+  "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496";
+const V3_BURN_TOPIC =
+  "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
+
+const UNISWAP_V2_FACTORY = "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f";
+const UNISWAP_V3_FACTORY = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa";
+const UNISWAP_QUOTER_V2 = "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7";
+
+const QUOTE_EXACT_INPUT_SINGLE_SELECTOR = "0xc6a5026a";
+const BALANCE_OF_SELECTOR = "0x70a08231";
+const TOKEN0_SELECTOR = "0x0dfe1681";
+const TOKEN1_SELECTOR = "0xd21220a7";
+const FACTORY_SELECTOR = "0xc45a0155";
+const GET_RESERVES_SELECTOR = "0x0902f1ac";
+const V3_LIQUIDITY_SELECTOR = "0x1a686502";
+const V3_FEE_SELECTOR = "0xddca3f43";
+
+const liquidityMemory = new Map();
+
 const JSON_HEADERS = {
   "content-type": "application/json; charset=UTF-8",
   "access-control-allow-origin": "*",
@@ -71,6 +91,134 @@ function decodeString(hex) {
   }
 }
 
+
+function hexWord(hex, index = 0) {
+  const raw = stripHexPrefix(hex);
+  const start = index * 64;
+  if (raw.length < start + 64) return null;
+  return raw.slice(start, start + 64);
+}
+
+function decodeAddress(hex) {
+  const word = hexWord(hex, 0);
+  if (!word) return null;
+  const address = "0x" + word.slice(24);
+  return isAddress(address) ? address.toLowerCase() : null;
+}
+
+function wordAddress(address) {
+  return stripHexPrefix(address).toLowerCase().padStart(64, "0");
+}
+
+function wordUint(value) {
+  try {
+    return BigInt(value).toString(16).padStart(64, "0");
+  } catch {
+    return null;
+  }
+}
+
+function decodeBigIntWord(hex, index = 0) {
+  const word = hexWord(hex, index);
+  if (!word) return null;
+  try {
+    return BigInt("0x" + word);
+  } catch {
+    return null;
+  }
+}
+
+function unitsToNumber(rawValue, decimals) {
+  try {
+    const raw = BigInt(rawValue);
+    const d = Number(decimals);
+    if (!Number.isInteger(d) || d < 0 || d > 36) return null;
+
+    const base = 10n ** BigInt(d);
+    const whole = raw / base;
+    const fracDigits = Math.min(d, 12);
+    const frac = (raw % base)
+      .toString()
+      .padStart(d, "0")
+      .slice(0, fracDigits);
+
+    return Number(frac ? `${whole}.${frac}` : whole.toString());
+  } catch {
+    return null;
+  }
+}
+
+function humanToUnits(value, decimals) {
+  const n = Number(value);
+  const d = Number(decimals);
+  if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(d) || d < 0 || d > 36) {
+    return null;
+  }
+
+  if (n >= 1e21) return null;
+
+  const precision = Math.min(d, 12);
+  const fixed = n.toFixed(precision);
+  const [whole, frac = ""] = fixed.split(".");
+
+  try {
+    const wholeUnits = BigInt(whole) * 10n ** BigInt(d);
+    const fracUnits =
+      d > 0
+        ? BigInt((frac + "0".repeat(d)).slice(0, d) || "0")
+        : 0n;
+    return wholeUnits + fracUnits;
+  } catch {
+    return null;
+  }
+}
+
+function bigIntDropPct(firstValue, lastValue) {
+  try {
+    const first = BigInt(firstValue);
+    const last = BigInt(lastValue);
+    if (first <= 0n || last >= first) return 0;
+    const bps = Number(((first - last) * 10000n) / first);
+    return bps / 100;
+  } catch {
+    return null;
+  }
+}
+
+function pctDrop(first, last) {
+  const a = Number(first);
+  const b = Number(last);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b >= a) return 0;
+  return ((a - b) / a) * 100;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function memoryObservation(poolAddress) {
+  const key = String(poolAddress || "").toLowerCase();
+  const item = liquidityMemory.get(key);
+  if (!item) return null;
+  if (Date.now() - item.at > 15 * 60 * 1000) {
+    liquidityMemory.delete(key);
+    return null;
+  }
+  return item;
+}
+
+function storeMemoryObservation(poolAddress, observation) {
+  const key = String(poolAddress || "").toLowerCase();
+  liquidityMemory.set(key, { ...observation, at: Date.now() });
+
+  if (liquidityMemory.size > 250) {
+    const cutoff = Date.now() - 15 * 60 * 1000;
+    for (const [k, v] of liquidityMemory.entries()) {
+      if (v.at < cutoff) liquidityMemory.delete(k);
+    }
+  }
+}
+
 async function rpc(env, method, params = []) {
   if (!env.ALCHEMY_RPC_URL) {
     throw new Error("Missing ALCHEMY_RPC_URL secret");
@@ -104,6 +252,301 @@ async function rpc(env, method, params = []) {
 
 async function ethCall(env, to, data) {
   return rpc(env, "eth_call", [{ to, data }, "latest"]);
+}
+
+
+async function tokenDecimals(env, address) {
+  const result = await ethCall(env, address, "0x313ce567").catch(() => null);
+  return result ? hexToNumber(result) : null;
+}
+
+async function tokenBalanceRaw(env, token, owner) {
+  const data = BALANCE_OF_SELECTOR + wordAddress(owner);
+  const result = await ethCall(env, token, data).catch(() => null);
+  const value = result ? decodeBigIntWord(result, 0) : null;
+  return value === null ? null : value.toString();
+}
+
+async function poolOnchainState(env, poolAddress) {
+  const [token0Hex, token1Hex, factoryHex, reservesHex, liquidityHex, feeHex, code] =
+    await Promise.all([
+      ethCall(env, poolAddress, TOKEN0_SELECTOR).catch(() => null),
+      ethCall(env, poolAddress, TOKEN1_SELECTOR).catch(() => null),
+      ethCall(env, poolAddress, FACTORY_SELECTOR).catch(() => null),
+      ethCall(env, poolAddress, GET_RESERVES_SELECTOR).catch(() => null),
+      ethCall(env, poolAddress, V3_LIQUIDITY_SELECTOR).catch(() => null),
+      ethCall(env, poolAddress, V3_FEE_SELECTOR).catch(() => null),
+      rpc(env, "eth_getCode", [poolAddress, "latest"]).catch(() => null),
+    ]);
+
+  const token0 = token0Hex ? decodeAddress(token0Hex) : null;
+  const token1 = token1Hex ? decodeAddress(token1Hex) : null;
+  const factory = factoryHex ? decodeAddress(factoryHex) : null;
+
+  let protocol = "UNKNOWN";
+  let reserve0 = null;
+  let reserve1 = null;
+  let activeLiquidity = null;
+  let fee = null;
+
+  if (reservesHex && stripHexPrefix(reservesHex).length >= 192) {
+    const r0 = decodeBigIntWord(reservesHex, 0);
+    const r1 = decodeBigIntWord(reservesHex, 1);
+    if (r0 !== null && r1 !== null) {
+      protocol = "V2";
+      reserve0 = r0.toString();
+      reserve1 = r1.toString();
+    }
+  }
+
+  if (protocol === "UNKNOWN" && liquidityHex && feeHex) {
+    const l = decodeBigIntWord(liquidityHex, 0);
+    const f = decodeBigIntWord(feeHex, 0);
+    if (l !== null && f !== null) {
+      protocol = "V3";
+      activeLiquidity = l.toString();
+      fee = Number(f);
+    }
+  }
+
+  let token0Balance = null;
+  let token1Balance = null;
+
+  if (token0 && token1) {
+    [token0Balance, token1Balance] = await Promise.all([
+      tokenBalanceRaw(env, token0, poolAddress),
+      tokenBalanceRaw(env, token1, poolAddress),
+    ]);
+  }
+
+  const canonical =
+    protocol === "V2"
+      ? factory === UNISWAP_V2_FACTORY
+      : protocol === "V3"
+      ? factory === UNISWAP_V3_FACTORY
+      : false;
+
+  return {
+    poolAddress: poolAddress.toLowerCase(),
+    hasCode: Boolean(code && code !== "0x"),
+    protocol,
+    factory,
+    canonicalUniswap: canonical,
+    token0,
+    token1,
+    reserve0,
+    reserve1,
+    activeLiquidity,
+    fee,
+    token0Balance,
+    token1Balance,
+  };
+}
+
+async function recentPoolBurnActivity(env, poolAddress, blocksBack = 40) {
+  const latestHex = await rpc(env, "eth_blockNumber");
+  const latest = hexToNumber(latestHex);
+  const requested = Math.min(Math.max(Number(blocksBack) || 40, 10), 100);
+  const first = Math.max(0, latest - requested + 1);
+
+  const ranges = [];
+  for (let start = first; start <= latest; start += 10) {
+    ranges.push([start, Math.min(start + 9, latest)]);
+  }
+
+  const batches = await Promise.all(
+    ranges.map(async ([fromBlock, toBlock]) => {
+      const logs = await rpc(env, "eth_getLogs", [
+        {
+          address: poolAddress,
+          fromBlock: toHex(fromBlock),
+          toBlock: toHex(toBlock),
+          topics: [[V2_BURN_TOPIC, V3_BURN_TOPIC]],
+        },
+      ]).catch(() => []);
+      return Array.isArray(logs) ? logs : [];
+    })
+  );
+
+  const logs = batches.flat();
+  let v2Burns = 0;
+  let v3Burns = 0;
+
+  for (const log of logs) {
+    const topic0 = String(log?.topics?.[0] || "").toLowerCase();
+    if (topic0 === V2_BURN_TOPIC) v2Burns += 1;
+    if (topic0 === V3_BURN_TOPIC) v3Burns += 1;
+  }
+
+  return {
+    blocksScanned: latest - first + 1,
+    fromBlock: first,
+    latestBlock: latest,
+    totalBurnEvents: logs.length,
+    v2Burns,
+    v3Burns,
+  };
+}
+
+function v2QuoteAmountOut(amountIn, reserveIn, reserveOut, feeBps = 30) {
+  try {
+    const input = BigInt(amountIn);
+    const rIn = BigInt(reserveIn);
+    const rOut = BigInt(reserveOut);
+    if (input <= 0n || rIn <= 0n || rOut <= 0n) return null;
+
+    const feeDenom = 10000n;
+    const amountInWithFee = input * (feeDenom - BigInt(feeBps));
+    return (amountInWithFee * rOut) / (rIn * feeDenom + amountInWithFee);
+  } catch {
+    return null;
+  }
+}
+
+async function v3QuoterAmountOut(env, tokenIn, tokenOut, amountIn, fee) {
+  const amountWord = wordUint(amountIn);
+  const feeWord = wordUint(fee);
+  if (!amountWord || !feeWord) return null;
+
+  const data =
+    QUOTE_EXACT_INPUT_SINGLE_SELECTOR +
+    wordAddress(tokenIn) +
+    wordAddress(tokenOut) +
+    amountWord +
+    feeWord +
+    wordUint(0);
+
+  const result = await ethCall(env, UNISWAP_QUOTER_V2, data).catch(() => null);
+  const amountOut = result ? decodeBigIntWord(result, 0) : null;
+  return amountOut === null ? null : amountOut;
+}
+
+async function quotePoolExit(env, targetAddress, pair, poolState, sizeUsd) {
+  const baseAddress = String(pair?.baseToken?.address || "").toLowerCase();
+  const quoteAddress = String(pair?.quoteToken?.address || "").toLowerCase();
+  const target = String(targetAddress || "").toLowerCase();
+
+  if (!isAddress(baseAddress) || !isAddress(quoteAddress)) {
+    return { available: false, reason: "Pair token addresses unavailable" };
+  }
+
+  if (target !== baseAddress && target !== quoteAddress) {
+    return { available: false, reason: "Target token is not part of selected pool" };
+  }
+
+  const priceUsdBase = Number(pair?.priceUsd || 0);
+  const priceNative = Number(pair?.priceNative || 0);
+  if (!(priceUsdBase > 0) || !(priceNative > 0)) {
+    return { available: false, reason: "Pair price unavailable" };
+  }
+
+  const quoteUsd = priceUsdBase / priceNative;
+  const targetUsd = target === baseAddress ? priceUsdBase : quoteUsd;
+  if (!(targetUsd > 0)) {
+    return { available: false, reason: "Could not derive target USD price" };
+  }
+
+  const tokenIn = target;
+  const tokenOut = target === baseAddress ? quoteAddress : baseAddress;
+
+  const [decimalsIn, decimalsOut] = await Promise.all([
+    tokenDecimals(env, tokenIn),
+    tokenDecimals(env, tokenOut),
+  ]);
+
+  if (!Number.isInteger(decimalsIn) || !Number.isInteger(decimalsOut)) {
+    return { available: false, reason: "Token decimals unavailable" };
+  }
+
+  const runOne = async (usd) => {
+    const amountInHuman = Number(usd) / targetUsd;
+    const amountInRaw = humanToUnits(amountInHuman, decimalsIn);
+    if (amountInRaw === null || amountInRaw <= 0n) return null;
+
+    const expectedOutHuman =
+      target === baseAddress
+        ? amountInHuman * priceNative
+        : amountInHuman / priceNative;
+
+    let amountOutRaw = null;
+    let method = null;
+    let feeAssumptionBps = null;
+
+    if (poolState.protocol === "V2" && poolState.canonicalUniswap) {
+      const token0 = poolState.token0;
+      if (!token0 || !poolState.reserve0 || !poolState.reserve1) return null;
+      const tokenInIs0 = tokenIn === token0;
+      const reserveIn = tokenInIs0 ? poolState.reserve0 : poolState.reserve1;
+      const reserveOut = tokenInIs0 ? poolState.reserve1 : poolState.reserve0;
+      feeAssumptionBps = 30;
+      amountOutRaw = v2QuoteAmountOut(
+        amountInRaw,
+        reserveIn,
+        reserveOut,
+        feeAssumptionBps
+      );
+      method = "UNISWAP_V2_RESERVES";
+    } else if (
+      poolState.protocol === "V3" &&
+      poolState.canonicalUniswap &&
+      Number.isInteger(poolState.fee)
+    ) {
+      amountOutRaw = await v3QuoterAmountOut(
+        env,
+        tokenIn,
+        tokenOut,
+        amountInRaw,
+        poolState.fee
+      );
+      method = "UNISWAP_V3_QUOTER_V2";
+    } else {
+      return null;
+    }
+
+    if (amountOutRaw === null) return null;
+
+    const amountOutHuman = unitsToNumber(amountOutRaw, decimalsOut);
+    if (!(amountOutHuman >= 0) || !(expectedOutHuman > 0)) return null;
+
+    const impactPct = Math.max(
+      0,
+      ((expectedOutHuman - amountOutHuman) / expectedOutHuman) * 100
+    );
+
+    return {
+      sizeUsd: Number(usd),
+      amountInHuman,
+      amountOutHuman,
+      expectedOutHumanNoImpact: expectedOutHuman,
+      estimatedPoolPriceImpactPct: impactPct,
+      method,
+      feeAssumptionBps,
+    };
+  };
+
+  const [normal, stress] = await Promise.all([
+    runOne(sizeUsd),
+    runOne(Number(sizeUsd) * 2),
+  ]);
+
+  if (!normal) {
+    return {
+      available: false,
+      reason:
+        "No supported canonical V2/V3 quote for this pool. V4 and non-canonical pools still require another quote source.",
+    };
+  }
+
+  return {
+    available: true,
+    tokenIn,
+    tokenOut,
+    targetUsd,
+    normal,
+    stress,
+    caveat:
+      "This simulates pool execution only. It does not prove ERC-20 sellability and may not include token transfer taxes, blacklist logic, or router-specific effects.",
+  };
 }
 
 async function tokenMetadata(env, address) {
@@ -375,6 +818,390 @@ async function recentSwapPoolCounts(env, blocksBack = 2400) {
   };
 }
 
+
+async function guardSample(env, poolAddress) {
+  const pair = await dexPairByPool(poolAddress).catch(() => null);
+  if (!pair) return null;
+
+  const onchain = await poolOnchainState(env, poolAddress).catch(() => null);
+
+  return {
+    at: new Date().toISOString(),
+    liquidityUsd: Number(pair?.liquidity?.usd || 0),
+    priceUsd: Number(pair?.priceUsd || 0),
+    pair: simplifyPair(pair),
+    onchain,
+  };
+}
+
+function worstStepDrop(values) {
+  let worst = 0;
+  for (let i = 1; i < values.length; i += 1) {
+    worst = Math.max(worst, pctDrop(values[i - 1], values[i]));
+  }
+  return worst;
+}
+
+async function liquidityGuard(env, address, url) {
+  const sizeUsd = Math.max(Number(url.searchParams.get("sizeUsd") || 200), 1);
+  const samplesCount = Math.min(
+    Math.max(Number(url.searchParams.get("samples") || 3), 2),
+    3
+  );
+  const delayMs = Math.min(
+    Math.max(Number(url.searchParams.get("delayMs") || 2000), 750),
+    4000
+  );
+  const burnBlocks = Math.min(
+    Math.max(Number(url.searchParams.get("burnBlocks") || 40), 10),
+    100
+  );
+  const requestedPool = String(url.searchParams.get("pool") || "").toLowerCase();
+
+  if (requestedPool && !isAddress(requestedPool)) {
+    throw new Error("Invalid pool address");
+  }
+
+  const pairs = await dexTokenPairs(address);
+  const best = bestPair(pairs);
+
+  let selected = null;
+  if (requestedPool) {
+    selected =
+      pairs.find(
+        (p) =>
+          String(p.pairAddress || "").toLowerCase() === requestedPool
+      ) || (await dexPairByPool(requestedPool).catch(() => null));
+  } else {
+    selected = best;
+  }
+
+  if (!selected) {
+    return {
+      service: "MONSTER LIQUIDITY GUARD",
+      status: "BLOCK",
+      tradePermission: false,
+      contract: address,
+      reason: "No Robinhood Chain pool found for requested token/pool.",
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  const poolAddress = String(selected.pairAddress || "").toLowerCase();
+  if (!isAddress(poolAddress)) {
+    return {
+      service: "MONSTER LIQUIDITY GUARD",
+      status: "BLOCK",
+      tradePermission: false,
+      contract: address,
+      reason:
+        "Selected market does not expose an EVM pool address that can be guarded on-chain.",
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  const previousWarm = memoryObservation(poolAddress);
+
+  const samples = [];
+  for (let i = 0; i < samplesCount; i += 1) {
+    const sample = await guardSample(env, poolAddress);
+    if (sample) samples.push(sample);
+    if (i < samplesCount - 1) await sleep(delayMs);
+  }
+
+  if (!samples.length) {
+    throw new Error("Liquidity Guard could not sample selected pool");
+  }
+
+  const latest = samples[samples.length - 1];
+  const first = samples[0];
+  const onchainFirst = first.onchain || {};
+  const onchainLatest = latest.onchain || {};
+
+  const liquiditySeries = samples.map((s) => Number(s.liquidityUsd || 0));
+  const firstToLastLiquidityDropPct = pctDrop(
+    liquiditySeries[0],
+    liquiditySeries[liquiditySeries.length - 1]
+  );
+  const worstStepLiquidityDropPct = worstStepDrop(liquiditySeries);
+
+  const token0BalanceDropPct =
+    onchainFirst.token0Balance && onchainLatest.token0Balance
+      ? bigIntDropPct(onchainFirst.token0Balance, onchainLatest.token0Balance)
+      : null;
+  const token1BalanceDropPct =
+    onchainFirst.token1Balance && onchainLatest.token1Balance
+      ? bigIntDropPct(onchainFirst.token1Balance, onchainLatest.token1Balance)
+      : null;
+
+  const activeLiquidityDropPct =
+    onchainFirst.activeLiquidity && onchainLatest.activeLiquidity
+      ? bigIntDropPct(
+          onchainFirst.activeLiquidity,
+          onchainLatest.activeLiquidity
+        )
+      : null;
+
+  const bothPoolBalancesDropped =
+    token0BalanceDropPct !== null &&
+    token1BalanceDropPct !== null &&
+    token0BalanceDropPct >= 20 &&
+    token1BalanceDropPct >= 20;
+
+  const currentLiquidityUsd = Number(latest.liquidityUsd || 0);
+  const sizeVsLiquidityPct =
+    currentLiquidityUsd > 0 ? (sizeUsd / currentLiquidityUsd) * 100 : null;
+
+  const warmDropPct =
+    previousWarm?.liquidityUsd > 0
+      ? pctDrop(previousWarm.liquidityUsd, currentLiquidityUsd)
+      : null;
+
+  const burns = await recentPoolBurnActivity(
+    env,
+    poolAddress,
+    burnBlocks
+  ).catch(() => null);
+
+  const quote = await quotePoolExit(
+    env,
+    address,
+    latest.pair,
+    onchainLatest,
+    sizeUsd
+  ).catch(() => ({
+    available: false,
+    reason: "Quote check failed",
+  }));
+
+  const bestPoolAddress = String(best?.pairAddress || "").toLowerCase();
+  const bestLiquidityUsd = Number(best?.liquidity?.usd || 0);
+  const possibleMigration =
+    requestedPool &&
+    bestPoolAddress &&
+    bestPoolAddress !== poolAddress &&
+    bestLiquidityUsd > currentLiquidityUsd * 1.5;
+
+  const critical = [];
+  const warnings = [];
+  const positives = [];
+
+  if (!(currentLiquidityUsd > 0)) {
+    critical.push("Liquidity is zero or unavailable.");
+  }
+
+  if (sizeVsLiquidityPct !== null && sizeVsLiquidityPct > 1.5) {
+    critical.push(
+      `Trade size is ${sizeVsLiquidityPct.toFixed(
+        2
+      )}% of reported liquidity (>1.5%).`
+    );
+  } else if (sizeVsLiquidityPct !== null && sizeVsLiquidityPct > 0.5) {
+    warnings.push(
+      `Trade size is ${sizeVsLiquidityPct.toFixed(
+        2
+      )}% of reported liquidity; Monster target is <=0.50%.`
+    );
+  } else if (sizeVsLiquidityPct !== null) {
+    positives.push(
+      `Trade size is ${sizeVsLiquidityPct.toFixed(
+        2
+      )}% of reported liquidity (<=0.50%).`
+    );
+  }
+
+  if (
+    firstToLastLiquidityDropPct >= 25 ||
+    worstStepLiquidityDropPct >= 25
+  ) {
+    critical.push(
+      `DEX liquidity collapsed during guard sampling (${Math.max(
+        firstToLastLiquidityDropPct,
+        worstStepLiquidityDropPct
+      ).toFixed(1)}% drop).`
+    );
+  } else if (
+    firstToLastLiquidityDropPct >= 10 ||
+    worstStepLiquidityDropPct >= 10
+  ) {
+    warnings.push(
+      `DEX liquidity weakened during guard sampling (${Math.max(
+        firstToLastLiquidityDropPct,
+        worstStepLiquidityDropPct
+      ).toFixed(1)}% drop).`
+    );
+  } else {
+    positives.push("DEX liquidity stayed stable during the pre-trade sample.");
+  }
+
+  if (warmDropPct !== null && warmDropPct >= 25) {
+    critical.push(
+      `Liquidity is down ${warmDropPct.toFixed(
+        1
+      )}% versus the previous observation in this warm Worker instance.`
+    );
+  } else if (warmDropPct !== null && warmDropPct >= 10) {
+    warnings.push(
+      `Liquidity is down ${warmDropPct.toFixed(
+        1
+      )}% versus the previous warm-instance observation.`
+    );
+  }
+
+  if (bothPoolBalancesDropped) {
+    critical.push(
+      `Both pool token balances fell sharply during sampling (${token0BalanceDropPct.toFixed(
+        1
+      )}% / ${token1BalanceDropPct.toFixed(1)}%).`
+    );
+  }
+
+  if (activeLiquidityDropPct !== null && activeLiquidityDropPct >= 30) {
+    critical.push(
+      `V3 active in-range liquidity fell ${activeLiquidityDropPct.toFixed(
+        1
+      )}% during sampling.`
+    );
+  } else if (activeLiquidityDropPct !== null && activeLiquidityDropPct >= 15) {
+    warnings.push(
+      `V3 active in-range liquidity fell ${activeLiquidityDropPct.toFixed(
+        1
+      )}% during sampling.`
+    );
+  }
+
+  if (burns?.totalBurnEvents > 0) {
+    if (onchainLatest.protocol === "V2" && burns.v2Burns > 0) {
+      warnings.push(
+        `${burns.v2Burns} V2 liquidity-removal Burn event(s) detected in the recent block window.`
+      );
+    } else if (onchainLatest.protocol === "V3" && burns.v3Burns >= 3) {
+      warnings.push(
+        `${burns.v3Burns} V3 Burn event(s) detected recently; range repositioning is possible, so verify liquidity stability.`
+      );
+    }
+  }
+
+  if (possibleMigration) {
+    critical.push(
+      `Requested pool is no longer the dominant pool; another pool has materially more liquidity. Treat as possible migration until verified.`
+    );
+  }
+
+  if (quote?.available) {
+    const impact = Number(quote.normal?.estimatedPoolPriceImpactPct || 0);
+    const stressImpact = Number(
+      quote.stress?.estimatedPoolPriceImpactPct ?? impact
+    );
+
+    if (impact > 5 || stressImpact > 10) {
+      critical.push(
+        `Executable pool quote is too fragile (${impact.toFixed(
+          2
+        )}% impact at target size; ${stressImpact.toFixed(
+          2
+        )}% at 2x stress size).`
+      );
+    } else if (impact > 2 || stressImpact > 5) {
+      warnings.push(
+        `Pool quote shows meaningful impact (${impact.toFixed(
+          2
+        )}% at target size; ${stressImpact.toFixed(2)}% at 2x stress size).`
+      );
+    } else {
+      positives.push(
+        `Pool quote impact is controlled (${impact.toFixed(
+          2
+        )}% at target size; ${stressImpact.toFixed(2)}% at 2x stress size).`
+      );
+    }
+  } else {
+    warnings.push(
+      `No canonical V2/V3 executable quote was available: ${
+        quote?.reason || "unknown reason"
+      }.`
+    );
+  }
+
+  let status = "PASS";
+  let tradePermission = true;
+
+  if (critical.length) {
+    status = "BLOCK";
+    tradePermission = false;
+  } else if (warnings.length) {
+    status = "WAIT";
+    tradePermission = false;
+  } else if (
+    sizeVsLiquidityPct !== null &&
+    sizeVsLiquidityPct <= 0.25 &&
+    quote?.available &&
+    Number(quote.normal?.estimatedPoolPriceImpactPct || 99) <= 1
+  ) {
+    status = "STRONG_PASS";
+  }
+
+  storeMemoryObservation(poolAddress, {
+    liquidityUsd: currentLiquidityUsd,
+    priceUsd: Number(latest.priceUsd || 0),
+  });
+
+  return {
+    service: "MONSTER LIQUIDITY GUARD",
+    version: "2.2",
+    status,
+    tradePermission,
+    network: "Robinhood Chain",
+    contract: address,
+    requestedPool: requestedPool || null,
+    selectedPool: poolAddress,
+    bestPool: bestPoolAddress || null,
+    possibleMigration,
+    sizeUsd,
+    samplePlan: {
+      samplesRequested: samplesCount,
+      samplesCompleted: samples.length,
+      delayMs,
+      totalSamplingWindowMs:
+        samples.length > 1 ? delayMs * (samples.length - 1) : 0,
+      note:
+        "The fast sampling window is designed to catch second-scale liquidity instability immediately before a trade. It cannot guarantee future liquidity.",
+    },
+    liquidity: {
+      currentUsd: currentLiquidityUsd,
+      seriesUsd: liquiditySeries,
+      firstToLastDropPct: firstToLastLiquidityDropPct,
+      worstStepDropPct: worstStepLiquidityDropPct,
+      sizeVsLiquidityPct,
+      monsterTargetPct: 0.5,
+      monsterStrongTargetPct: 0.25,
+      warmInstancePreviousDropPct: warmDropPct,
+    },
+    onchainPool: {
+      protocol: onchainLatest.protocol || "UNKNOWN",
+      factory: onchainLatest.factory || null,
+      canonicalUniswap: Boolean(onchainLatest.canonicalUniswap),
+      token0: onchainLatest.token0 || null,
+      token1: onchainLatest.token1 || null,
+      token0BalanceDropPct,
+      token1BalanceDropPct,
+      v3ActiveLiquidityDropPct: activeLiquidityDropPct,
+      recentBurnActivity: burns,
+    },
+    exitQuote: quote,
+    critical,
+    warnings,
+    positives,
+    pair: simplifyPair(latest.pair, null, sizeUsd),
+    checkedAt: new Date().toISOString(),
+    hardCaveats: [
+      "A PASS is not a guarantee that LP cannot be removed after the check.",
+      "The quote tests pool mechanics only and does not prove honeypot/tax/blacklist/admin safety.",
+      "Warm-instance history is best-effort only and is not durable storage; the real blocking logic relies on current multi-sample/on-chain checks.",
+    ],
+  };
+}
+
 async function scanMomentum(env, url) {
   const blocks = Math.min(
     Math.max(Number(url.searchParams.get("blocks") || 100), 10),
@@ -405,9 +1232,17 @@ async function scanMomentum(env, url) {
       const liquidity = Number(pair.liquidity?.usd || 0);
       if (liquidity < minLiquidity) return null;
 
+      const candidateContract = pair?.baseToken?.address || null;
       return {
         poolAddress: item.poolAddress,
+        candidateContract,
         recentSwapLogs: item.swapLogs,
+        quickLiquidityGuard:
+          candidateContract && isAddress(candidateContract)
+            ? `/guard/${candidateContract}?pool=${item.poolAddress}&sizeUsd=${
+                sizeUsd ?? 200
+              }`
+            : null,
         pair: simplifyPair(pair, item.swapLogs, sizeUsd),
       };
     })
@@ -448,6 +1283,7 @@ async function scanMomentum(env, url) {
 
   return {
     service: "MONSTER LIVE FEED",
+    version: "2.2",
     status: "ONLINE",
     network: "Robinhood Chain",
     chainId: EXPECTED_CHAIN_ID,
@@ -469,7 +1305,8 @@ async function scanMomentum(env, url) {
     notes: [
       "Discovery is based on the most recent Robinhood Chain blocks and canonical V2/V3 Swap event signatures. On Alchemy Free, log queries are automatically split into 10-block batches.",
       "DEX Screener is used only to enrich discovered Robinhood pools with price/liquidity/volume/transaction windows.",
-      "This is a momentum discovery feed, not a trade approval. Security, executable quote/slippage, contract risk, and structure still require Monster Trading validation.",
+      "Each candidate now includes a /guard path. Monster Trading should require Liquidity Guard before entry.",
+      "This is a momentum discovery feed, not a trade approval. Contract security and structure still require Monster Trading validation.",
     ],
   };
 }
@@ -505,6 +1342,7 @@ export default {
 
         return json({
           service: "MONSTER LIVE FEED",
+          version: "2.2",
           status: chainId === EXPECTED_CHAIN_ID ? "ONLINE" : "WRONG_NETWORK",
           network: "Robinhood Chain",
           blockNumber: hexToNumber(blockHex),
@@ -515,6 +1353,8 @@ export default {
           endpoints: {
             health: "/health",
             scan: "/scan?blocks=100&limit=12&minLiquidity=1000&sizeUsd=200",
+            guard:
+              "/guard/0x...?pool=0x...&sizeUsd=200&samples=3&delayMs=2000",
             token: "/token/0x...",
             market: "/market/0x...",
             snapshot: "/snapshot/0x...?sizeUsd=200",
@@ -537,6 +1377,11 @@ export default {
       const [route, address] = parts;
       if (!isAddress(address)) {
         return json({ error: "Invalid EVM contract address" }, 400);
+      }
+
+      if (route === "guard") {
+        const result = await liquidityGuard(env, address, url);
+        return json(result, 200, 0);
       }
 
       if (route === "token") {
