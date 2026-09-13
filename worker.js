@@ -5,6 +5,12 @@ const V2_SWAP_TOPIC =
   "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const V3_SWAP_TOPIC =
   "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+const V4_SWAP_TOPIC =
+  "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f";
+const V4_INITIALIZE_TOPIC =
+  "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
+const V4_MODIFY_LIQUIDITY_TOPIC =
+  "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec";
 
 const V2_BURN_TOPIC =
   "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496";
@@ -15,6 +21,14 @@ const UNISWAP_V2_FACTORY = "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f";
 const UNISWAP_V3_FACTORY = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa";
 const UNISWAP_QUOTER_V2 = "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7";
 
+// Canonical Uniswap v4 deployment on Robinhood Chain (chainId 4663).
+const UNISWAP_V4_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
+const UNISWAP_V4_STATE_VIEW = "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b";
+const UNISWAP_V4_QUOTER = "0x8dc178efb8111bb0973dd9d722ebeff267c98f94";
+const UNISWAP_V4_DEPLOY_BLOCK = 9070;
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+const ROBINHOOD_BLOCKSCOUT = "https://robinhoodchain.blockscout.com";
+
 const QUOTE_EXACT_INPUT_SINGLE_SELECTOR = "0xc6a5026a";
 const BALANCE_OF_SELECTOR = "0x70a08231";
 const TOKEN0_SELECTOR = "0x0dfe1681";
@@ -23,8 +37,12 @@ const FACTORY_SELECTOR = "0xc45a0155";
 const GET_RESERVES_SELECTOR = "0x0902f1ac";
 const V3_LIQUIDITY_SELECTOR = "0x1a686502";
 const V3_FEE_SELECTOR = "0xddca3f43";
+const V4_GET_LIQUIDITY_SELECTOR = "0xfa6793d5";
+const V4_GET_SLOT0_SELECTOR = "0xc815641c";
+const V4_QUOTE_EXACT_INPUT_SINGLE_SELECTOR = "0xaa9d21cb";
 
 const liquidityMemory = new Map();
+const v4PoolKeyMemory = new Map();
 
 const JSON_HEADERS = {
   "content-type": "application/json; charset=UTF-8",
@@ -44,6 +62,14 @@ function json(data, status = 200, cacheSeconds = 0) {
 
 function isAddress(value) {
   return /^0x[a-fA-F0-9]{40}$/.test(value || "");
+}
+
+function isBytes32(value) {
+  return /^0x[a-fA-F0-9]{64}$/.test(value || "");
+}
+
+function isPoolIdentifier(value) {
+  return isAddress(value) || isBytes32(value);
 }
 
 function hexToNumber(hex) {
@@ -126,6 +152,36 @@ function decodeBigIntWord(hex, index = 0) {
   } catch {
     return null;
   }
+}
+
+function decodeSignedBigIntWord(hex, index = 0) {
+  const word = hexWord(hex, index);
+  if (!word) return null;
+  try {
+    let value = BigInt("0x" + word);
+    if (value >= (1n << 255n)) value -= 1n << 256n;
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function signedWord(value) {
+  try {
+    let n = BigInt(value);
+    if (n < 0n) n = (1n << 256n) + n;
+    if (n < 0n || n >= (1n << 256n)) return null;
+    return n.toString(16).padStart(64, "0");
+  } catch {
+    return null;
+  }
+}
+
+function indexedAddress(topic) {
+  const raw = stripHexPrefix(topic);
+  if (raw.length !== 64) return null;
+  const address = "0x" + raw.slice(24);
+  return isAddress(address) ? address.toLowerCase() : null;
 }
 
 function unitsToNumber(rawValue, decimals) {
@@ -260,6 +316,11 @@ async function tokenDecimals(env, address) {
   return result ? hexToNumber(result) : null;
 }
 
+async function currencyDecimals(env, address) {
+  if (String(address || "").toLowerCase() === ZERO_ADDRESS) return 18;
+  return tokenDecimals(env, address);
+}
+
 async function tokenBalanceRaw(env, token, owner) {
   const data = BALANCE_OF_SELECTOR + wordAddress(owner);
   const result = await ethCall(env, token, data).catch(() => null);
@@ -343,6 +404,205 @@ async function poolOnchainState(env, poolAddress) {
   };
 }
 
+
+function isV4Pair(pair) {
+  return Array.isArray(pair?.labels) &&
+    pair.labels.some((x) => String(x || "").toLowerCase() === "v4");
+}
+
+function v4PoolKeyCacheGet(poolId) {
+  const key = String(poolId || "").toLowerCase();
+  const item = v4PoolKeyMemory.get(key);
+  if (!item) return null;
+  if (Date.now() - item.at > 6 * 60 * 60 * 1000) {
+    v4PoolKeyMemory.delete(key);
+    return null;
+  }
+  return item.poolKey;
+}
+
+function v4PoolKeyCacheSet(poolId, poolKey) {
+  const key = String(poolId || "").toLowerCase();
+  v4PoolKeyMemory.set(key, { poolKey, at: Date.now() });
+  if (v4PoolKeyMemory.size > 250) {
+    const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+    for (const [k, v] of v4PoolKeyMemory.entries()) {
+      if (v.at < cutoff) v4PoolKeyMemory.delete(k);
+    }
+  }
+}
+
+function decodeV4InitializeLog(log) {
+  const poolId = String(log?.topics?.[1] || "").toLowerCase();
+  const currency0 = indexedAddress(log?.topics?.[2]);
+  const currency1 = indexedAddress(log?.topics?.[3]);
+  if (!isBytes32(poolId) || !currency0 || !currency1) return null;
+
+  const feeRaw = decodeBigIntWord(log?.data, 0);
+  const tickSpacingRaw = decodeSignedBigIntWord(log?.data, 1);
+  const hooksWord = hexWord(log?.data, 2);
+  const hooks = hooksWord ? "0x" + hooksWord.slice(24) : null;
+  if (feeRaw === null || tickSpacingRaw === null || !isAddress(hooks)) return null;
+
+  return {
+    poolId,
+    currency0,
+    currency1,
+    fee: Number(feeRaw),
+    tickSpacing: Number(tickSpacingRaw),
+    hooks: hooks.toLowerCase(),
+  };
+}
+
+async function resolveV4PoolKey(env, poolId) {
+  const id = String(poolId || "").toLowerCase();
+  if (!isBytes32(id)) return null;
+
+  const cached = v4PoolKeyCacheGet(id);
+  if (cached) return cached;
+
+  const latestHex = await rpc(env, "eth_blockNumber");
+  const latest = hexToNumber(latestHex);
+
+  // Exact indexed-topic filter should normally return a single Initialize event.
+  // Try the full PoolManager lifetime first; if the provider rejects the range,
+  // fall back to progressively smaller recent windows.
+  const starts = [
+    UNISWAP_V4_DEPLOY_BLOCK,
+    Math.max(UNISWAP_V4_DEPLOY_BLOCK, latest - 1_000_000),
+    Math.max(UNISWAP_V4_DEPLOY_BLOCK, latest - 250_000),
+    Math.max(UNISWAP_V4_DEPLOY_BLOCK, latest - 50_000),
+  ];
+
+  for (const start of [...new Set(starts)]) {
+    const logs = await rpc(env, "eth_getLogs", [
+      {
+        address: UNISWAP_V4_POOL_MANAGER,
+        fromBlock: toHex(start),
+        toBlock: toHex(latest),
+        topics: [V4_INITIALIZE_TOPIC, id],
+      },
+    ]).catch(() => null);
+
+    if (Array.isArray(logs) && logs.length) {
+      const poolKey = decodeV4InitializeLog(logs[logs.length - 1]);
+      if (poolKey) {
+        v4PoolKeyCacheSet(id, poolKey);
+        return poolKey;
+      }
+    }
+  }
+
+  // Fallback to the official Robinhood Chain Blockscout index. This avoids
+  // expensive historical RPC scans when the pool was initialized long ago.
+  try {
+    const qs = new URLSearchParams({
+      module: "logs",
+      action: "getLogs",
+      fromBlock: String(UNISWAP_V4_DEPLOY_BLOCK),
+      toBlock: "latest",
+      address: UNISWAP_V4_POOL_MANAGER,
+      topic0: V4_INITIALIZE_TOPIC,
+      topic1: id,
+      topic0_1_opr: "and",
+    });
+    const r = await fetch(`${ROBINHOOD_BLOCKSCOUT}/api?${qs.toString()}`, {
+      headers: { accept: "application/json" },
+    });
+    if (r.ok) {
+      const body = await r.json();
+      const logs = Array.isArray(body?.result) ? body.result : [];
+      if (logs.length) {
+        const poolKey = decodeV4InitializeLog(logs[logs.length - 1]);
+        if (poolKey) {
+          v4PoolKeyCacheSet(id, poolKey);
+          return poolKey;
+        }
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
+async function v4PoolOnchainState(env, poolId) {
+  const id = String(poolId || "").toLowerCase();
+  if (!isBytes32(id)) return null;
+
+  const [liquidityHex, slot0Hex, managerCode, stateViewCode, poolKey] =
+    await Promise.all([
+      ethCall(env, UNISWAP_V4_STATE_VIEW, V4_GET_LIQUIDITY_SELECTOR + stripHexPrefix(id)).catch(() => null),
+      ethCall(env, UNISWAP_V4_STATE_VIEW, V4_GET_SLOT0_SELECTOR + stripHexPrefix(id)).catch(() => null),
+      rpc(env, "eth_getCode", [UNISWAP_V4_POOL_MANAGER, "latest"]).catch(() => null),
+      rpc(env, "eth_getCode", [UNISWAP_V4_STATE_VIEW, "latest"]).catch(() => null),
+      resolveV4PoolKey(env, id).catch(() => null),
+    ]);
+
+  const liquidity = liquidityHex ? decodeBigIntWord(liquidityHex, 0) : null;
+  const sqrtPriceX96 = slot0Hex ? decodeBigIntWord(slot0Hex, 0) : null;
+  const tick = slot0Hex ? decodeSignedBigIntWord(slot0Hex, 1) : null;
+  const protocolFee = slot0Hex ? decodeBigIntWord(slot0Hex, 2) : null;
+  const lpFee = slot0Hex ? decodeBigIntWord(slot0Hex, 3) : null;
+
+  return {
+    poolAddress: id,
+    poolId: id,
+    hasCode: Boolean(managerCode && managerCode !== "0x" && stateViewCode && stateViewCode !== "0x"),
+    protocol: "V4",
+    poolManager: UNISWAP_V4_POOL_MANAGER,
+    stateView: UNISWAP_V4_STATE_VIEW,
+    canonicalUniswap: true,
+    token0: poolKey?.currency0 || null,
+    token1: poolKey?.currency1 || null,
+    reserve0: null,
+    reserve1: null,
+    activeLiquidity: liquidity === null ? null : liquidity.toString(),
+    fee: poolKey?.fee ?? (lpFee === null ? null : Number(lpFee)),
+    tickSpacing: poolKey?.tickSpacing ?? null,
+    hooks: poolKey?.hooks ?? null,
+    sqrtPriceX96: sqrtPriceX96 === null ? null : sqrtPriceX96.toString(),
+    tick: tick === null ? null : Number(tick),
+    protocolFee: protocolFee === null ? null : Number(protocolFee),
+    token0Balance: null,
+    token1Balance: null,
+    poolKey: poolKey || null,
+  };
+}
+
+async function recentV4LiquidityActivity(env, poolId, blocksBack = 40) {
+  const latestHex = await rpc(env, "eth_blockNumber");
+  const latest = hexToNumber(latestHex);
+  const requested = Math.min(Math.max(Number(blocksBack) || 40, 10), 200);
+  const first = Math.max(0, latest - requested + 1);
+
+  const logs = await rpc(env, "eth_getLogs", [
+    {
+      address: UNISWAP_V4_POOL_MANAGER,
+      fromBlock: toHex(first),
+      toBlock: toHex(latest),
+      topics: [V4_MODIFY_LIQUIDITY_TOPIC, String(poolId).toLowerCase()],
+    },
+  ]).catch(() => []);
+
+  let removals = 0;
+  let additions = 0;
+  for (const log of Array.isArray(logs) ? logs : []) {
+    const delta = decodeSignedBigIntWord(log?.data, 2);
+    if (delta === null) continue;
+    if (delta < 0n) removals += 1;
+    if (delta > 0n) additions += 1;
+  }
+
+  return {
+    blocksScanned: latest - first + 1,
+    fromBlock: first,
+    latestBlock: latest,
+    totalModifyLiquidityEvents: Array.isArray(logs) ? logs.length : 0,
+    additions,
+    removals,
+  };
+}
+
 async function recentPoolBurnActivity(env, poolAddress, blocksBack = 40) {
   const latestHex = await rpc(env, "eth_blockNumber");
   const latest = hexToNumber(latestHex);
@@ -421,6 +681,40 @@ async function v3QuoterAmountOut(env, tokenIn, tokenOut, amountIn, fee) {
   return amountOut === null ? null : amountOut;
 }
 
+
+async function v4QuoterAmountOut(env, poolKey, zeroForOne, amountIn) {
+  if (!poolKey) return null;
+  const amountWord = wordUint(amountIn);
+  const feeWord = wordUint(poolKey.fee);
+  const tickSpacingWord = signedWord(poolKey.tickSpacing);
+  if (!amountWord || !feeWord || !tickSpacingWord) return null;
+  if (!isAddress(poolKey.currency0) || !isAddress(poolKey.currency1) || !isAddress(poolKey.hooks)) {
+    return null;
+  }
+
+  // ABI for quoteExactInputSingle(((address,address,uint24,int24,address),bool,uint128,bytes))
+  // The tuple is dynamic because hookData is bytes, so the outer argument is an offset.
+  const tupleHead =
+    wordAddress(poolKey.currency0) +
+    wordAddress(poolKey.currency1) +
+    feeWord +
+    tickSpacingWord +
+    wordAddress(poolKey.hooks) +
+    wordUint(zeroForOne ? 1 : 0) +
+    amountWord +
+    wordUint(8 * 32);
+  const emptyBytes = wordUint(0);
+  const data =
+    V4_QUOTE_EXACT_INPUT_SINGLE_SELECTOR +
+    wordUint(32) +
+    tupleHead +
+    emptyBytes;
+
+  const result = await ethCall(env, UNISWAP_V4_QUOTER, data).catch(() => null);
+  const amountOut = result ? decodeBigIntWord(result, 0) : null;
+  return amountOut === null ? null : amountOut;
+}
+
 async function quotePoolExit(env, targetAddress, pair, poolState, sizeUsd) {
   const baseAddress = String(pair?.baseToken?.address || "").toLowerCase();
   const quoteAddress = String(pair?.quoteToken?.address || "").toLowerCase();
@@ -450,8 +744,8 @@ async function quotePoolExit(env, targetAddress, pair, poolState, sizeUsd) {
   const tokenOut = target === baseAddress ? quoteAddress : baseAddress;
 
   const [decimalsIn, decimalsOut] = await Promise.all([
-    tokenDecimals(env, tokenIn),
-    tokenDecimals(env, tokenOut),
+    currencyDecimals(env, tokenIn),
+    currencyDecimals(env, tokenOut),
   ]);
 
   if (!Number.isInteger(decimalsIn) || !Number.isInteger(decimalsOut)) {
@@ -499,6 +793,22 @@ async function quotePoolExit(env, targetAddress, pair, poolState, sizeUsd) {
         poolState.fee
       );
       method = "UNISWAP_V3_QUOTER_V2";
+    } else if (
+      poolState.protocol === "V4" &&
+      poolState.canonicalUniswap &&
+      poolState.poolKey
+    ) {
+      const currency0 = String(poolState.poolKey.currency0 || "").toLowerCase();
+      const currency1 = String(poolState.poolKey.currency1 || "").toLowerCase();
+      if (tokenIn !== currency0 && tokenIn !== currency1) return null;
+      const zeroForOne = tokenIn === currency0;
+      amountOutRaw = await v4QuoterAmountOut(
+        env,
+        poolState.poolKey,
+        zeroForOne,
+        amountInRaw
+      );
+      method = "UNISWAP_V4_QUOTER";
     } else {
       return null;
     }
@@ -533,7 +843,7 @@ async function quotePoolExit(env, targetAddress, pair, poolState, sizeUsd) {
     return {
       available: false,
       reason:
-        "No supported canonical V2/V3 quote for this pool. V4 and non-canonical pools still require another quote source.",
+        "No supported canonical V2/V3/V4 executable quote was available for this pool.",
     };
   }
 
@@ -775,7 +1085,7 @@ async function recentSwapPoolCounts(env, blocksBack = 2400) {
         {
           fromBlock: toHex(fromBlock),
           toBlock: toHex(toBlock),
-          topics: [[V2_SWAP_TOPIC, V3_SWAP_TOPIC]],
+          topics: [[V2_SWAP_TOPIC, V3_SWAP_TOPIC, V4_SWAP_TOPIC]],
         },
       ]);
       return Array.isArray(logs) ? logs : [];
@@ -787,11 +1097,24 @@ async function recentSwapPoolCounts(env, blocksBack = 2400) {
   const pools = new Map();
 
   for (const log of allLogs) {
-    const address = String(log.address || "").toLowerCase();
-    if (!isAddress(address)) continue;
+    const topic0 = String(log?.topics?.[0] || "").toLowerCase();
+    const emitter = String(log.address || "").toLowerCase();
 
-    const current = pools.get(address) || {
-      poolAddress: address,
+    let poolIdentifier = emitter;
+    let protocol = "V2/V3";
+
+    if (topic0 === V4_SWAP_TOPIC) {
+      if (emitter !== UNISWAP_V4_POOL_MANAGER) continue;
+      poolIdentifier = String(log?.topics?.[1] || "").toLowerCase();
+      protocol = "V4";
+      if (!isBytes32(poolIdentifier)) continue;
+    } else if (!isAddress(poolIdentifier)) {
+      continue;
+    }
+
+    const current = pools.get(poolIdentifier) || {
+      poolAddress: poolIdentifier,
+      protocol,
       swapLogs: 0,
       firstSeenBlock: null,
       lastSeenBlock: null,
@@ -806,7 +1129,7 @@ async function recentSwapPoolCounts(env, blocksBack = 2400) {
       current.lastSeenBlock = bn;
     }
 
-    pools.set(address, current);
+    pools.set(poolIdentifier, current);
   }
 
   return {
@@ -819,11 +1142,14 @@ async function recentSwapPoolCounts(env, blocksBack = 2400) {
 }
 
 
-async function guardSample(env, poolAddress) {
-  const pair = await dexPairByPool(poolAddress).catch(() => null);
+async function guardSample(env, poolIdentifier) {
+  const pair = await dexPairByPool(poolIdentifier).catch(() => null);
   if (!pair) return null;
 
-  const onchain = await poolOnchainState(env, poolAddress).catch(() => null);
+  const v4 = isBytes32(poolIdentifier) || isV4Pair(pair);
+  const onchain = v4
+    ? await v4PoolOnchainState(env, poolIdentifier).catch(() => null)
+    : await poolOnchainState(env, poolIdentifier).catch(() => null);
 
   return {
     at: new Date().toISOString(),
@@ -858,8 +1184,8 @@ async function liquidityGuard(env, address, url) {
   );
   const requestedPool = String(url.searchParams.get("pool") || "").toLowerCase();
 
-  if (requestedPool && !isAddress(requestedPool)) {
-    throw new Error("Invalid pool address");
+  if (requestedPool && !isPoolIdentifier(requestedPool)) {
+    throw new Error("Invalid pool identifier");
   }
 
   const pairs = await dexTokenPairs(address);
@@ -888,14 +1214,28 @@ async function liquidityGuard(env, address, url) {
   }
 
   const poolAddress = String(selected.pairAddress || "").toLowerCase();
-  if (!isAddress(poolAddress)) {
+  const selectedIsV4 = isV4Pair(selected) || isBytes32(poolAddress);
+  if (!isPoolIdentifier(poolAddress)) {
     return {
       service: "MONSTER LIQUIDITY GUARD",
       status: "BLOCK",
       tradePermission: false,
       contract: address,
       reason:
-        "Selected market does not expose an EVM pool address that can be guarded on-chain.",
+        "Selected market does not expose a supported EVM pool address or Uniswap v4 poolId.",
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  if (selectedIsV4 && !isBytes32(poolAddress)) {
+    return {
+      service: "MONSTER LIQUIDITY GUARD",
+      status: "WAIT",
+      tradePermission: false,
+      contract: address,
+      requestedPool: requestedPool || null,
+      selectedPool: poolAddress,
+      reason: "V4 market was detected but DexScreener did not expose a bytes32 poolId.",
       checkedAt: new Date().toISOString(),
     };
   }
@@ -957,11 +1297,9 @@ async function liquidityGuard(env, address, url) {
       ? pctDrop(previousWarm.liquidityUsd, currentLiquidityUsd)
       : null;
 
-  const burns = await recentPoolBurnActivity(
-    env,
-    poolAddress,
-    burnBlocks
-  ).catch(() => null);
+  const burns = selectedIsV4
+    ? await recentV4LiquidityActivity(env, poolAddress, burnBlocks).catch(() => null)
+    : await recentPoolBurnActivity(env, poolAddress, burnBlocks).catch(() => null);
 
   const quote = await quotePoolExit(
     env,
@@ -1070,7 +1408,17 @@ async function liquidityGuard(env, address, url) {
     );
   }
 
-  if (burns?.totalBurnEvents > 0) {
+  if (onchainLatest.protocol === "V4" && burns?.removals > 0) {
+    if (burns.removals >= 3) {
+      warnings.push(
+        `${burns.removals} V4 liquidity-removal ModifyLiquidity event(s) detected recently; verify active-liquidity stability.`
+      );
+    } else {
+      positives.push(
+        `Only ${burns.removals} V4 liquidity-removal event(s) detected in the recent block window.`
+      );
+    }
+  } else if (burns?.totalBurnEvents > 0) {
     if (onchainLatest.protocol === "V2" && burns.v2Burns > 0) {
       warnings.push(
         `${burns.v2Burns} V2 liquidity-removal Burn event(s) detected in the recent block window.`
@@ -1117,7 +1465,7 @@ async function liquidityGuard(env, address, url) {
     }
   } else {
     warnings.push(
-      `No canonical V2/V3 executable quote was available: ${
+      `No canonical V2/V3/V4 executable quote was available: ${
         quote?.reason || "unknown reason"
       }.`
     );
@@ -1148,7 +1496,7 @@ async function liquidityGuard(env, address, url) {
 
   return {
     service: "MONSTER LIQUIDITY GUARD",
-    version: "2.2",
+    version: "2.3",
     status,
     tradePermission,
     network: "Robinhood Chain",
@@ -1180,12 +1528,18 @@ async function liquidityGuard(env, address, url) {
     onchainPool: {
       protocol: onchainLatest.protocol || "UNKNOWN",
       factory: onchainLatest.factory || null,
+      poolManager: onchainLatest.poolManager || null,
+      stateView: onchainLatest.stateView || null,
       canonicalUniswap: Boolean(onchainLatest.canonicalUniswap),
       token0: onchainLatest.token0 || null,
       token1: onchainLatest.token1 || null,
+      fee: onchainLatest.fee ?? null,
+      tickSpacing: onchainLatest.tickSpacing ?? null,
+      hooks: onchainLatest.hooks || null,
+      v4PoolKeyResolved: Boolean(onchainLatest.poolKey),
       token0BalanceDropPct,
       token1BalanceDropPct,
-      v3ActiveLiquidityDropPct: activeLiquidityDropPct,
+      activeLiquidityDropPct,
       recentBurnActivity: burns,
     },
     exitQuote: quote,
@@ -1196,7 +1550,7 @@ async function liquidityGuard(env, address, url) {
     checkedAt: new Date().toISOString(),
     hardCaveats: [
       "A PASS is not a guarantee that LP cannot be removed after the check.",
-      "The quote tests pool mechanics only and does not prove honeypot/tax/blacklist/admin safety.",
+      "The quote tests pool mechanics only and does not prove honeypot/tax/blacklist/admin safety. V4 quotes additionally depend on resolving the canonical PoolKey from its Initialize event.",
       "Warm-instance history is best-effort only and is not durable storage; the real blocking logic relies on current multi-sample/on-chain checks.",
     ],
   };
@@ -1283,7 +1637,7 @@ async function scanMomentum(env, url) {
 
   return {
     service: "MONSTER LIVE FEED",
-    version: "2.2",
+    version: "2.3",
     status: "ONLINE",
     network: "Robinhood Chain",
     chainId: EXPECTED_CHAIN_ID,
@@ -1303,9 +1657,9 @@ async function scanMomentum(env, url) {
     candidates,
     checkedAt: new Date().toISOString(),
     notes: [
-      "Discovery is based on the most recent Robinhood Chain blocks and canonical V2/V3 Swap event signatures. On Alchemy Free, log queries are automatically split into 10-block batches.",
+      "Discovery is based on the most recent Robinhood Chain blocks and canonical Uniswap V2/V3/V4 Swap event signatures. V4 swaps are attributed by PoolManager poolId (topic[1]).",
       "DEX Screener is used only to enrich discovered Robinhood pools with price/liquidity/volume/transaction windows.",
-      "Each candidate now includes a /guard path. Monster Trading should require Liquidity Guard before entry.",
+      "Each candidate includes a /guard path. Liquidity Guard accepts V2/V3 pool addresses and Uniswap v4 bytes32 poolIds.",
       "This is a momentum discovery feed, not a trade approval. Contract security and structure still require Monster Trading validation.",
     ],
   };
@@ -1342,7 +1696,7 @@ export default {
 
         return json({
           service: "MONSTER LIVE FEED",
-          version: "2.2",
+          version: "2.3",
           status: chainId === EXPECTED_CHAIN_ID ? "ONLINE" : "WRONG_NETWORK",
           network: "Robinhood Chain",
           blockNumber: hexToNumber(blockHex),
@@ -1354,7 +1708,7 @@ export default {
             health: "/health",
             scan: "/scan?blocks=100&limit=12&minLiquidity=1000&sizeUsd=200",
             guard:
-              "/guard/0x...?pool=0x...&sizeUsd=200&samples=3&delayMs=2000",
+              "/guard/0x...?pool=0x...&sizeUsd=200&samples=3&delayMs=2000 (pool may be V2/V3 address or V4 bytes32 poolId)",
             token: "/token/0x...",
             market: "/market/0x...",
             snapshot: "/snapshot/0x...?sizeUsd=200",
