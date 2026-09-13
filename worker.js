@@ -1694,7 +1694,7 @@ async function liquidityGuard(env, address, url) {
 
   return {
     service: "MONSTER LIQUIDITY GUARD",
-    version: "2.4",
+    version: "2.4.1",
     status,
     tradePermission,
     network: "Robinhood Chain",
@@ -1803,6 +1803,9 @@ async function scanMomentum(env, url) {
       ...item,
       ...(creationMap.get(key) || {}),
       poolAddress: key,
+      // Normalize the activity field so downstream ranking/reporting never
+      // loses the swap count from recentSwapPoolCounts (which calls it swapLogs).
+      recentSwapLogs: Number(item.swapLogs || 0),
       discoveryLane: creationMap.has(key) ? "EARLY_GESTATION" : "MOMENTUM",
       newPoolDetected: creationMap.has(key),
     });
@@ -1944,7 +1947,7 @@ async function scanMomentum(env, url) {
 
   return {
     service: "MONSTER LIVE FEED",
-    version: "2.4",
+    version: "2.4.1",
     status: "ONLINE",
     network: "Robinhood Chain",
     chainId: EXPECTED_CHAIN_ID,
@@ -2010,7 +2013,7 @@ export default {
 
         return json({
           service: "MONSTER LIVE FEED",
-          version: "2.4",
+          version: "2.4.1",
           status: chainId === EXPECTED_CHAIN_ID ? "ONLINE" : "WRONG_NETWORK",
           network: "Robinhood Chain",
           blockNumber: hexToNumber(blockHex),
