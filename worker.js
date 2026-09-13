@@ -11,6 +11,10 @@ const V4_INITIALIZE_TOPIC =
   "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
 const V4_MODIFY_LIQUIDITY_TOPIC =
   "0xf208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec";
+const V2_PAIR_CREATED_TOPIC =
+  "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9";
+const V3_POOL_CREATED_TOPIC =
+  "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118";
 
 const V2_BURN_TOPIC =
   "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496";
@@ -454,6 +458,88 @@ function decodeV4InitializeLog(log) {
   };
 }
 
+
+function decodeV2PairCreatedLog(log) {
+  const token0 = indexedAddress(log?.topics?.[1]);
+  const token1 = indexedAddress(log?.topics?.[2]);
+  const pairWord = hexWord(log?.data, 0);
+  const pairAddress = pairWord ? "0x" + pairWord.slice(24) : null;
+  if (!token0 || !token1 || !isAddress(pairAddress)) return null;
+  return {
+    poolAddress: pairAddress.toLowerCase(),
+    protocol: "V2",
+    token0,
+    token1,
+    fee: 3000,
+    tickSpacing: null,
+    hooks: null,
+  };
+}
+
+function decodeV3PoolCreatedLog(log) {
+  const token0 = indexedAddress(log?.topics?.[1]);
+  const token1 = indexedAddress(log?.topics?.[2]);
+  const feeTopic = String(log?.topics?.[3] || "");
+  const fee = feeTopic ? hexToNumber(feeTopic) : null;
+  const tickSpacingRaw = decodeSignedBigIntWord(log?.data, 0);
+  const poolWord = hexWord(log?.data, 1);
+  const poolAddress = poolWord ? "0x" + poolWord.slice(24) : null;
+  if (!token0 || !token1 || !isAddress(poolAddress)) return null;
+  return {
+    poolAddress: poolAddress.toLowerCase(),
+    protocol: "V3",
+    token0,
+    token1,
+    fee: Number.isFinite(fee) ? fee : null,
+    tickSpacing: tickSpacingRaw === null ? null : Number(tickSpacingRaw),
+    hooks: null,
+  };
+}
+
+async function blockscoutV4PoolKey(poolId, maxPages = 12) {
+  let next = null;
+  const id = String(poolId || "").toLowerCase();
+  if (!isBytes32(id)) return null;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const qs = new URLSearchParams();
+    if (next) {
+      for (const [k, v] of Object.entries(next)) {
+        if (v !== null && v !== undefined) qs.set(k, String(v));
+      }
+    }
+
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    const r = await fetch(
+      `${ROBINHOOD_BLOCKSCOUT}/api/v2/addresses/${UNISWAP_V4_POOL_MANAGER}/logs${suffix}`,
+      { headers: { accept: "application/json" } }
+    ).catch(() => null);
+    if (!r?.ok) return null;
+
+    const body = await r.json().catch(() => null);
+    const items = Array.isArray(body?.items) ? body.items : [];
+    for (const log of items) {
+      const topics = Array.isArray(log?.topics) ? log.topics : [];
+      if (
+        String(topics[0] || "").toLowerCase() === V4_INITIALIZE_TOPIC &&
+        String(topics[1] || "").toLowerCase() === id
+      ) {
+        const poolKey = decodeV4InitializeLog({
+          topics,
+          data: log?.data,
+          blockNumber: log?.block_number,
+        });
+        if (poolKey) return poolKey;
+      }
+    }
+
+    next = body?.next_page_params || null;
+    if (!next) break;
+  }
+
+  return null;
+}
+
 async function resolveV4PoolKey(env, poolId) {
   const id = String(poolId || "").toLowerCase();
   if (!isBytes32(id)) return null;
@@ -461,25 +547,27 @@ async function resolveV4PoolKey(env, poolId) {
   const cached = v4PoolKeyCacheGet(id);
   if (cached) return cached;
 
+  // First use Blockscout's paginated address-log index. This avoids large
+  // eth_getLogs ranges that some RPC/free tiers reject.
+  const indexedPoolKey = await blockscoutV4PoolKey(id, 12).catch(() => null);
+  if (indexedPoolKey) {
+    v4PoolKeyCacheSet(id, indexedPoolKey);
+    return indexedPoolKey;
+  }
+
   const latestHex = await rpc(env, "eth_blockNumber");
   const latest = hexToNumber(latestHex);
 
-  // Exact indexed-topic filter should normally return a single Initialize event.
-  // Try the full PoolManager lifetime first; if the provider rejects the range,
-  // fall back to progressively smaller recent windows.
-  const starts = [
-    UNISWAP_V4_DEPLOY_BLOCK,
-    Math.max(UNISWAP_V4_DEPLOY_BLOCK, latest - 1_000_000),
-    Math.max(UNISWAP_V4_DEPLOY_BLOCK, latest - 250_000),
-    Math.max(UNISWAP_V4_DEPLOY_BLOCK, latest - 50_000),
-  ];
-
-  for (const start of [...new Set(starts)]) {
+  // RPC fallback: scan the recent history in provider-friendly 10-block chunks.
+  // New/gestating pools are the priority, so search newest blocks first.
+  const recentFloor = Math.max(UNISWAP_V4_DEPLOY_BLOCK, latest - 5000);
+  for (let end = latest; end >= recentFloor; end -= 10) {
+    const start = Math.max(recentFloor, end - 9);
     const logs = await rpc(env, "eth_getLogs", [
       {
         address: UNISWAP_V4_POOL_MANAGER,
         fromBlock: toHex(start),
-        toBlock: toHex(latest),
+        toBlock: toHex(end),
         topics: [V4_INITIALIZE_TOPIC, id],
       },
     ]).catch(() => null);
@@ -493,8 +581,7 @@ async function resolveV4PoolKey(env, poolId) {
     }
   }
 
-  // Fallback to the official Robinhood Chain Blockscout index. This avoids
-  // expensive historical RPC scans when the pool was initialized long ago.
+  // Legacy Blockscout RPC-compatible API as a final fallback.
   try {
     const qs = new URLSearchParams({
       module: "logs",
@@ -1142,6 +1229,117 @@ async function recentSwapPoolCounts(env, blocksBack = 2400) {
 }
 
 
+async function recentPoolCreations(env, blocksBack = 100) {
+  const latestHex = await rpc(env, "eth_blockNumber");
+  const latest = hexToNumber(latestHex);
+  const requested = Math.min(Math.max(Number(blocksBack) || 100, 10), 200);
+  const first = Math.max(0, latest - requested + 1);
+
+  const ranges = [];
+  for (let start = first; start <= latest; start += 10) {
+    ranges.push([start, Math.min(start + 9, latest)]);
+  }
+
+  const batches = await Promise.all(
+    ranges.map(async ([fromBlock, toBlock]) => {
+      const logs = await rpc(env, "eth_getLogs", [
+        {
+          fromBlock: toHex(fromBlock),
+          toBlock: toHex(toBlock),
+          topics: [[V2_PAIR_CREATED_TOPIC, V3_POOL_CREATED_TOPIC, V4_INITIALIZE_TOPIC]],
+        },
+      ]).catch(() => []);
+      return Array.isArray(logs) ? logs : [];
+    })
+  );
+
+  const created = [];
+  for (const log of batches.flat()) {
+    const topic0 = String(log?.topics?.[0] || "").toLowerCase();
+    const emitter = String(log?.address || "").toLowerCase();
+    const blockNumber = hexToNumber(log?.blockNumber);
+    let decoded = null;
+
+    if (topic0 === V2_PAIR_CREATED_TOPIC && emitter === UNISWAP_V2_FACTORY) {
+      decoded = decodeV2PairCreatedLog(log);
+    } else if (topic0 === V3_POOL_CREATED_TOPIC && emitter === UNISWAP_V3_FACTORY) {
+      decoded = decodeV3PoolCreatedLog(log);
+    } else if (topic0 === V4_INITIALIZE_TOPIC && emitter === UNISWAP_V4_POOL_MANAGER) {
+      const v4 = decodeV4InitializeLog(log);
+      if (v4) {
+        decoded = {
+          poolAddress: v4.poolId,
+          protocol: "V4",
+          token0: v4.currency0,
+          token1: v4.currency1,
+          fee: v4.fee,
+          tickSpacing: v4.tickSpacing,
+          hooks: v4.hooks,
+        };
+        v4PoolKeyCacheSet(v4.poolId, v4);
+      }
+    }
+
+    if (!decoded || !Number.isFinite(blockNumber)) continue;
+    created.push({
+      ...decoded,
+      createdBlock: blockNumber,
+      ageBlocks: Math.max(0, latest - blockNumber),
+      creationTxHash: log?.transactionHash || null,
+    });
+  }
+
+  return {
+    latestBlock: latest,
+    fromBlock: first,
+    blocksScanned: latest - first + 1,
+    creations: created.sort((a, b) => b.createdBlock - a.createdBlock),
+  };
+}
+
+async function dexPairForDiscovery(item) {
+  const direct = await dexPairByPool(item.poolAddress).catch(() => null);
+  if (direct) return direct;
+
+  const tokenCandidates = [item.token0, item.token1]
+    .map((x) => String(x || "").toLowerCase())
+    .filter((x) => isAddress(x) && x !== ZERO_ADDRESS);
+
+  const unique = [...new Set(tokenCandidates)].slice(0, 2);
+  if (!unique.length) return null;
+
+  const lists = await Promise.all(
+    unique.map((token) => dexTokenPairs(token).catch(() => []))
+  );
+  for (const pair of lists.flat()) {
+    if (
+      String(pair?.pairAddress || "").toLowerCase() ===
+      String(item.poolAddress || "").toLowerCase()
+    ) {
+      return pair;
+    }
+  }
+  return null;
+}
+
+function discoveryTimingRank(candidate) {
+  const sig = candidate?.pair?.signals || {};
+  if (sig.timingHint === "EARLY_ACCELERATION") return 4;
+  if (sig.timingHint === "ACTIVE") return 3;
+  if (sig.timingHint === "NEUTRAL") return 2;
+  if (sig.timingHint === "EXTENDED") return 0;
+  return 1;
+}
+
+function candidateActivity(candidate) {
+  const p = candidate?.pair || {};
+  const tx5 = txCount(p?.txns?.m5);
+  const vol5 = Number(p?.volume?.m5 || 0);
+  const swaps = Number(candidate?.recentSwapLogs || 0);
+  return { tx5, vol5, swaps };
+}
+
+
 async function guardSample(env, poolIdentifier) {
   const pair = await dexPairByPool(poolIdentifier).catch(() => null);
   if (!pair) return null;
@@ -1496,7 +1694,7 @@ async function liquidityGuard(env, address, url) {
 
   return {
     service: "MONSTER LIQUIDITY GUARD",
-    version: "2.3",
+    version: "2.4",
     status,
     tradePermission,
     network: "Robinhood Chain",
@@ -1569,98 +1767,214 @@ async function scanMomentum(env, url) {
     Number(url.searchParams.get("minLiquidity") || 1000),
     0
   );
+  const earlyMinLiquidity = Math.max(
+    Number(url.searchParams.get("earlyMinLiquidity") || minLiquidity),
+    0
+  );
+  const earlyReserve = Math.min(
+    Math.max(Number(url.searchParams.get("earlyReserve") || 4), 0),
+    Math.min(limit, 8)
+  );
   const sizeUsd = url.searchParams.has("sizeUsd")
     ? Number(url.searchParams.get("sizeUsd"))
     : null;
 
-  const activity = await recentSwapPoolCounts(env, blocks);
+  const [activity, creationActivity] = await Promise.all([
+    recentSwapPoolCounts(env, blocks),
+    recentPoolCreations(env, blocks),
+  ]);
 
-  // Take the busiest pools first, then enrich only a bounded set.
-  const shortlist = activity.pools.slice(0, Math.min(limit * 3, 30));
+  const swapMap = new Map(
+    activity.pools.map((x) => [String(x.poolAddress || "").toLowerCase(), x])
+  );
+  const creationMap = new Map(
+    creationActivity.creations.map((x) => [String(x.poolAddress || "").toLowerCase(), x])
+  );
+
+  // Lane 1: the busiest pools now. Lane 2: newly created/initialized pools,
+  // even when their first swaps are not yet numerous enough for the top-30 list.
+  const momentumShortlist = activity.pools.slice(0, Math.min(limit * 3, 30));
+  const earlyShortlist = creationActivity.creations.slice(0, Math.min(limit * 2, 20));
+
+  const union = new Map();
+  for (const item of momentumShortlist) {
+    const key = String(item.poolAddress || "").toLowerCase();
+    union.set(key, {
+      ...item,
+      ...(creationMap.get(key) || {}),
+      poolAddress: key,
+      discoveryLane: creationMap.has(key) ? "EARLY_GESTATION" : "MOMENTUM",
+      newPoolDetected: creationMap.has(key),
+    });
+  }
+  for (const item of earlyShortlist) {
+    const key = String(item.poolAddress || "").toLowerCase();
+    const swaps = swapMap.get(key) || {};
+    union.set(key, {
+      ...item,
+      ...swaps,
+      poolAddress: key,
+      protocol: item.protocol || swaps.protocol || null,
+      recentSwapLogs: Number(swaps.swapLogs || 0),
+      firstSeenBlock: swaps.firstSeenBlock ?? null,
+      lastSeenBlock: swaps.lastSeenBlock ?? null,
+      discoveryLane: "EARLY_GESTATION",
+      newPoolDetected: true,
+    });
+  }
 
   const enriched = await Promise.all(
-    shortlist.map(async (item) => {
-      const pair = await dexPairByPool(item.poolAddress).catch(() => null);
+    [...union.values()].map(async (item) => {
+      const pair = await dexPairForDiscovery(item);
       if (!pair) return null;
 
       const liquidity = Number(pair.liquidity?.usd || 0);
-      if (liquidity < minLiquidity) return null;
+      const requiredLiquidity =
+        item.discoveryLane === "EARLY_GESTATION" ? earlyMinLiquidity : minLiquidity;
+      if (liquidity < requiredLiquidity) return null;
 
       const candidateContract = pair?.baseToken?.address || null;
+      const simplified = simplifyPair(pair, Number(item.recentSwapLogs || 0), sizeUsd);
+      const tx5 = txCount(simplified?.txns?.m5);
+      const vol5 = Number(simplified?.volume?.m5 || 0);
+      const hasFirstFlow =
+        Number(item.recentSwapLogs || 0) > 0 || tx5 > 0 || vol5 > 0;
+
       return {
         poolAddress: item.poolAddress,
         candidateContract,
-        recentSwapLogs: item.swapLogs,
+        recentSwapLogs: Number(item.recentSwapLogs || 0),
+        discovery: {
+          lane: item.discoveryLane,
+          protocol: item.protocol || (isV4Pair(pair) ? "V4" : null),
+          newPoolDetected: Boolean(item.newPoolDetected),
+          createdBlock: item.createdBlock ?? null,
+          ageBlocks: item.ageBlocks ?? null,
+          creationTxHash: item.creationTxHash ?? null,
+          firstSeenSwapBlock: item.firstSeenBlock ?? null,
+          lastSeenSwapBlock: item.lastSeenBlock ?? null,
+          firstFlowDetected: hasFirstFlow,
+        },
         quickLiquidityGuard:
           candidateContract && isAddress(candidateContract)
             ? `/guard/${candidateContract}?pool=${item.poolAddress}&sizeUsd=${
                 sizeUsd ?? 200
               }`
             : null,
-        pair: simplifyPair(pair, item.swapLogs, sizeUsd),
+        pair: simplified,
       };
     })
   );
 
-  const candidates = enriched
-    .filter(Boolean)
-    .sort((a, b) => {
-      const aSig = a.pair?.signals || {};
-      const bSig = b.pair?.signals || {};
+  const all = enriched.filter(Boolean);
 
-      const aEarly =
-        aSig.timingHint === "EARLY_ACCELERATION"
-          ? 3
-          : aSig.timingHint === "ACTIVE"
-          ? 2
-          : aSig.timingHint === "EXTENDED"
-          ? 0
-          : 1;
-      const bEarly =
-        bSig.timingHint === "EARLY_ACCELERATION"
-          ? 3
-          : bSig.timingHint === "ACTIVE"
-          ? 2
-          : bSig.timingHint === "EXTENDED"
-          ? 0
-          : 1;
+  const sorter = (a, b) => {
+    const ta = discoveryTimingRank(a);
+    const tb = discoveryTimingRank(b);
+    if (tb !== ta) return tb - ta;
 
-      if (bEarly !== aEarly) return bEarly - aEarly;
+    const aSig = a.pair?.signals || {};
+    const bSig = b.pair?.signals || {};
+    const va = Number(aSig.volumeAcceleration5mVs1hPace || 0);
+    const vb = Number(bSig.volumeAcceleration5mVs1hPace || 0);
+    if (vb !== va) return vb - va;
 
-      const va = Number(aSig.volumeAcceleration5mVs1hPace || 0);
-      const vb = Number(bSig.volumeAcceleration5mVs1hPace || 0);
-      if (vb !== va) return vb - va;
+    const aa = candidateActivity(a);
+    const ba = candidateActivity(b);
+    if (ba.tx5 !== aa.tx5) return ba.tx5 - aa.tx5;
+    if (ba.vol5 !== aa.vol5) return ba.vol5 - aa.vol5;
+    return ba.swaps - aa.swaps;
+  };
 
-      return b.recentSwapLogs - a.recentSwapLogs;
+  // Reserve a few result slots for fresh pools with real first flow. This is the
+  // anti-BLAST-miss lane: it prevents a young pool from being crowded out by
+  // already-busy older pools before its first expansion candle.
+  const earlyActionable = all
+    .filter((c) => {
+      if (c.discovery?.lane !== "EARLY_GESTATION") return false;
+      if (!c.discovery?.firstFlowDetected) return false;
+      return c.pair?.signals?.timingHint !== "EXTENDED";
     })
-    .slice(0, limit);
+    .sort((a, b) => {
+      const ageA = Number(a.discovery?.ageBlocks ?? 1e12);
+      const ageB = Number(b.discovery?.ageBlocks ?? 1e12);
+      const flowA = candidateActivity(a);
+      const flowB = candidateActivity(b);
+      if (flowB.tx5 !== flowA.tx5) return flowB.tx5 - flowA.tx5;
+      if (flowB.vol5 !== flowA.vol5) return flowB.vol5 - flowA.vol5;
+      return ageA - ageB;
+    });
+
+  const momentumCandidates = all
+    .filter((c) => !earlyActionable.includes(c))
+    .sort(sorter);
+
+  const selected = [];
+  const seen = new Set();
+  for (const c of earlyActionable.slice(0, earlyReserve)) {
+    const key = String(c.poolAddress || "").toLowerCase();
+    if (!seen.has(key)) {
+      selected.push(c);
+      seen.add(key);
+    }
+  }
+  for (const c of momentumCandidates) {
+    if (selected.length >= limit) break;
+    const key = String(c.poolAddress || "").toLowerCase();
+    if (!seen.has(key)) {
+      selected.push(c);
+      seen.add(key);
+    }
+  }
+  if (selected.length < limit) {
+    for (const c of earlyActionable) {
+      if (selected.length >= limit) break;
+      const key = String(c.poolAddress || "").toLowerCase();
+      if (!seen.has(key)) {
+        selected.push(c);
+        seen.add(key);
+      }
+    }
+  }
+
+  const earlyWatch = all
+    .filter((c) => c.discovery?.lane === "EARLY_GESTATION")
+    .sort((a, b) => Number(a.discovery?.ageBlocks ?? 1e12) - Number(b.discovery?.ageBlocks ?? 1e12))
+    .slice(0, 12);
 
   return {
     service: "MONSTER LIVE FEED",
-    version: "2.3",
+    version: "2.4",
     status: "ONLINE",
     network: "Robinhood Chain",
     chainId: EXPECTED_CHAIN_ID,
-    mode: "RECENT_SWAP_SCAN",
+    mode: "DUAL_LANE_MOMENTUM_AND_EARLY_GESTATION",
     latestBlock: activity.latestBlock,
-    fromBlock: activity.fromBlock,
-    blocksScanned: activity.blocksScanned,
+    fromBlock: Math.min(activity.fromBlock, creationActivity.fromBlock),
+    blocksScanned: blocks,
     matchedSwapLogs: activity.matchedSwapLogs,
     activePoolsDetected: activity.pools.length,
-    returnedCandidates: candidates.length,
+    newPoolsDetected: creationActivity.creations.length,
+    earlyActionableDetected: earlyActionable.length,
+    returnedCandidates: selected.length,
     parameters: {
       blocks,
       limit,
       minLiquidity,
+      earlyMinLiquidity,
+      earlyReserve,
       sizeUsd,
     },
-    candidates,
+    candidates: selected,
+    earlyWatch,
     checkedAt: new Date().toISOString(),
     notes: [
-      "Discovery is based on the most recent Robinhood Chain blocks and canonical Uniswap V2/V3/V4 Swap event signatures. V4 swaps are attributed by PoolManager poolId (topic[1]).",
-      "DEX Screener is used only to enrich discovered Robinhood pools with price/liquidity/volume/transaction windows.",
+      "Dual-lane discovery: MOMENTUM ranks active swap flow while EARLY_GESTATION watches newly created/initialized canonical Uniswap V2/V3/V4 pools before they become top-volume pools.",
+      "A small number of result slots are reserved for fresh pools only when first real flow exists and the move is not already EXTENDED.",
+      "DEX Screener is used to enrich Robinhood Chain pools with price/liquidity/volume/transaction windows; tx counts are not guaranteed unique wallets.",
       "Each candidate includes a /guard path. Liquidity Guard accepts V2/V3 pool addresses and Uniswap v4 bytes32 poolIds.",
-      "This is a momentum discovery feed, not a trade approval. Contract security and structure still require Monster Trading validation.",
+      "V4 Initialize events are cached immediately, improving PoolKey resolution and executable exit quoting for newly detected pools.",
+      "This is discovery, not trade approval. Liquidity Guard plus Monster Trading security/structure validation remain mandatory.",
     ],
   };
 }
@@ -1696,7 +2010,7 @@ export default {
 
         return json({
           service: "MONSTER LIVE FEED",
-          version: "2.3",
+          version: "2.4",
           status: chainId === EXPECTED_CHAIN_ID ? "ONLINE" : "WRONG_NETWORK",
           network: "Robinhood Chain",
           blockNumber: hexToNumber(blockHex),
@@ -1706,7 +2020,7 @@ export default {
           checkedAt: new Date().toISOString(),
           endpoints: {
             health: "/health",
-            scan: "/scan?blocks=100&limit=12&minLiquidity=1000&sizeUsd=200",
+            scan: "/scan?blocks=100&limit=12&minLiquidity=1000&earlyReserve=4&sizeUsd=200",
             guard:
               "/guard/0x...?pool=0x...&sizeUsd=200&samples=3&delayMs=2000 (pool may be V2/V3 address or V4 bytes32 poolId)",
             token: "/token/0x...",
