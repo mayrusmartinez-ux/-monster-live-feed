@@ -48,6 +48,12 @@ const V4_QUOTE_EXACT_INPUT_SINGLE_SELECTOR = "0xaa9d21cb";
 const liquidityMemory = new Map();
 const v4PoolKeyMemory = new Map();
 
+// SUPER MONSTER PRE-CALL memory.
+// Best-effort on a warm Worker instance. For durable history across restarts,
+// bind a KV/D1 store later; the scanner itself remains fully functional without it.
+const preCallMemory = new Map();
+const PRECALL_MEMORY_TTL_MS = 24 * 60 * 60 * 1000;
+
 const JSON_HEADERS = {
   "content-type": "application/json; charset=UTF-8",
   "access-control-allow-origin": "*",
@@ -1694,7 +1700,7 @@ async function liquidityGuard(env, address, url) {
 
   return {
     service: "MONSTER LIQUIDITY GUARD",
-    version: "2.4.1",
+    version: "3.2.0",
     status,
     tradePermission,
     network: "Robinhood Chain",
@@ -1751,6 +1757,494 @@ async function liquidityGuard(env, address, url) {
       "The quote tests pool mechanics only and does not prove honeypot/tax/blacklist/admin safety. V4 quotes additionally depend on resolving the canonical PoolKey from its Initialize event.",
       "Warm-instance history is best-effort only and is not durable storage; the real blocking logic relies on current multi-sample/on-chain checks.",
     ],
+  };
+}
+
+
+function prunePreCallMemory() {
+  const cutoff = Date.now() - PRECALL_MEMORY_TTL_MS;
+  for (const [key, value] of preCallMemory.entries()) {
+    if (!value?.firstDetectedAt || new Date(value.firstDetectedAt).getTime() < cutoff) {
+      preCallMemory.delete(key);
+    }
+  }
+}
+
+function preCallScore(candidate) {
+  const p = candidate?.pair || {};
+  const s = p?.signals || {};
+  const d = candidate?.discovery || {};
+  const liquidity = Number(p?.liquidityUsd || 0);
+  const mc = Number(p?.marketCap || p?.fdv || 0);
+  const tx5 = txCount(p?.txns?.m5);
+  const buys5 = Number(p?.txns?.m5?.buys || 0);
+  const sells5 = Number(p?.txns?.m5?.sells || 0);
+  const vol5 = Number(p?.volume?.m5 || 0);
+  const volAccel = Number(s?.volumeAcceleration5mVs1hPace || 0);
+  const txAccel = Number(s?.txAcceleration5mVs1hPace || 0);
+  const buyShare = Number(s?.buyShare5m ?? 0);
+  const pc5 = Number(p?.priceChange?.m5 || 0);
+  const ageMinutes = Number(d?.ageMinutes ?? NaN);
+  const ageBlocks = Number(d?.ageBlocks ?? 999999);
+
+  let score = 0;
+  const reasons = [];
+
+  if (d?.newPoolDetected) { score += 18; reasons.push("NEW_POOL"); }
+  if (d?.firstFlowDetected) { score += 12; reasons.push("FIRST_FLOW"); }
+  if (Number.isFinite(ageMinutes)) {
+    if (ageMinutes <= 10) { score += 12; reasons.push("VERY_YOUNG"); }
+    else if (ageMinutes <= 30) { score += 7; reasons.push("YOUNG"); }
+  } else if (ageBlocks <= 20) { score += 12; reasons.push("VERY_YOUNG"); }
+  else if (ageBlocks <= 60) { score += 7; reasons.push("YOUNG"); }
+
+  if (liquidity >= 10000) { score += 12; reasons.push("LIQUIDITY_10K_PLUS"); }
+  else if (liquidity >= 3000) { score += 7; reasons.push("LIQUIDITY_3K_PLUS"); }
+
+  if (tx5 >= 12) { score += 10; reasons.push("TX_FLOW"); }
+  else if (tx5 >= 5) { score += 6; reasons.push("EARLY_TX_FLOW"); }
+
+  if (buys5 > sells5 && buyShare >= 0.55) {
+    score += 10; reasons.push("BUY_DOMINANCE");
+  }
+  if (vol5 >= 5000) { score += 8; reasons.push("VOLUME_5M"); }
+  else if (vol5 >= 1000) { score += 4; reasons.push("EARLY_VOLUME"); }
+
+  if (volAccel >= 1.5) { score += 10; reasons.push("VOLUME_ACCELERATION"); }
+  if (txAccel >= 1.25) { score += 8; reasons.push("TX_ACCELERATION"); }
+
+  // PRE-CALL wants ignition, not a candle that has already escaped.
+  if (pc5 > 25 || s?.timingHint === "EXTENDED") {
+    score -= 25; reasons.push("EXTENDED_PENALTY");
+  } else if (pc5 >= -8 && pc5 <= 15) {
+    score += 8; reasons.push("EARLY_PRICE_WINDOW");
+  }
+
+  // Favor the micro-cap discovery zone without making MC mandatory.
+  if (mc > 0 && mc <= 50000) { score += 10; reasons.push("SS_MC_ZONE"); }
+  else if (mc > 50000 && mc <= 250000) { score += 5; reasons.push("MICROCAP_ZONE"); }
+
+  score = Math.max(0, Math.min(100, Math.round(score)));
+
+  let tier = "WATCH";
+  if (score >= 75) tier = "PRE_CALL_STRONG";
+  else if (score >= 55) tier = "PRE_CALL";
+  else if (score >= 35) tier = "GESTATING";
+
+  return {
+    score,
+    tier,
+    reasons,
+    metrics: {
+      marketCapOrFdv: mc || null,
+      liquidityUsd: liquidity || null,
+      tx5m: tx5,
+      buys5m: buys5,
+      sells5m: sells5,
+      buyShare5m: Number.isFinite(buyShare) ? buyShare : null,
+      volume5m: vol5,
+      volumeAcceleration5mVs1hPace: Number.isFinite(volAccel) ? volAccel : null,
+      txAcceleration5mVs1hPace: Number.isFinite(txAccel) ? txAccel : null,
+      priceChange5mPct: pc5,
+      ageBlocks: Number.isFinite(ageBlocks) && ageBlocks < 999999 ? ageBlocks : null,
+      ageMinutes: Number.isFinite(ageMinutes) ? ageMinutes : null,
+    },
+  };
+}
+
+function stampPreCall(candidate) {
+  prunePreCallMemory();
+  const key = String(candidate?.candidateContract || candidate?.poolAddress || "").toLowerCase();
+  if (!key) return null;
+
+  const now = new Date().toISOString();
+  const mc = Number(candidate?.pair?.marketCap || candidate?.pair?.fdv || 0) || null;
+  const price = Number(candidate?.pair?.priceUsd || 0) || null;
+  const existing = preCallMemory.get(key);
+
+  if (!existing) {
+    preCallMemory.set(key, {
+      firstDetectedAt: now,
+      firstDetectedMarketCap: mc,
+      firstDetectedPriceUsd: price,
+      firstDetectedPool: candidate?.poolAddress || null,
+      firstDetectedBy: candidate?.network === "Solana" ? "SUPER_MONSTER_SOLANA_PRECALL" : "SUPER_MONSTER_ONCHAIN",
+      lastSeenAt: now,
+      observations: 1,
+    });
+  } else {
+    existing.lastSeenAt = now;
+    existing.observations = Number(existing.observations || 0) + 1;
+    preCallMemory.set(key, existing);
+  }
+  return preCallMemory.get(key);
+}
+
+function superMonsterView(scanResult) {
+  const candidates = Array.isArray(scanResult?.candidates) ? scanResult.candidates : [];
+  const early = Array.isArray(scanResult?.earlyWatch) ? scanResult.earlyWatch : [];
+  const union = new Map();
+
+  for (const c of [...candidates, ...early]) {
+    const key = String(c?.candidateContract || c?.poolAddress || "").toLowerCase();
+    if (!key) continue;
+    union.set(key, c);
+  }
+
+  const ranked = [...union.values()].map((candidate) => {
+    const precall = preCallScore(candidate);
+    const timing = stampPreCall(candidate);
+    return {
+      ...candidate,
+      superMonster: {
+        ...precall,
+        firstDetection: timing,
+        callConfirmation: {
+          status: "NOT_CONNECTED",
+          note:
+            "Public-call timestamps require a Telegram/call-feed input or webhook. On-chain PRE-CALL detection is active independently.",
+        },
+        smartWallets: {
+          status: "PENDING_WALLET_FEED",
+          note:
+            "This Worker currently measures swap/transaction acceleration. Unique smart-wallet attribution needs a wallet-label/history feed.",
+        },
+      },
+    };
+  }).sort((a, b) => Number(b?.superMonster?.score || 0) - Number(a?.superMonster?.score || 0));
+
+  return {
+    service: "SUPER MONSTER",
+    version: "3.2.0",
+    status: "ONLINE",
+    network: "Robinhood Chain",
+    chainId: EXPECTED_CHAIN_ID,
+    architecture: [
+      "PRE_CALL",
+      "MONSTER_MOMENTUM",
+      "RADAR_SS",
+      "RADAR",
+      "MONSTER_TRADING",
+    ],
+    candidates: ranked,
+    strongest: ranked.filter((x) => x?.superMonster?.tier === "PRE_CALL_STRONG"),
+    preCall: ranked.filter((x) =>
+      ["PRE_CALL_STRONG", "PRE_CALL"].includes(x?.superMonster?.tier)
+    ),
+    checkedAt: new Date().toISOString(),
+    note:
+      "Read-only discovery. SUPER MONSTER ranks early on-chain ignition; it never executes a trade.",
+  };
+}
+
+
+function solanaPairSignals(pair) {
+  const tx5 = txCount(pair?.txns?.m5);
+  const tx1h = txCount(pair?.txns?.h1);
+  const vol5 = Number(pair?.volume?.m5 || 0);
+  const vol1h = Number(pair?.volume?.h1 || 0);
+  const buy5 = Number(pair?.txns?.m5?.buys || 0);
+  const sell5 = Number(pair?.txns?.m5?.sells || 0);
+  const buyShare = tx5 > 0 ? buy5 / tx5 : 0;
+  const volPace = vol1h > 0 ? vol1h / 12 : 0;
+  const txPace = tx1h > 0 ? tx1h / 12 : 0;
+  const pc5 = Number(pair?.priceChange?.m5 || 0);
+  return {
+    buyShare5m: buyShare,
+    volumeAcceleration5mVs1hPace: volPace > 0 ? vol5 / volPace : 0,
+    txAcceleration5mVs1hPace: txPace > 0 ? tx5 / txPace : 0,
+    timingHint: pc5 > 25 ? "EXTENDED" : "EARLY",
+  };
+}
+
+async function fetchJsonSafe(url, init = {}) {
+  const r = await fetch(url, {
+    ...init,
+    headers: {
+      accept: "application/json",
+      "user-agent": "SUPER-MONSTER/3.2",
+      ...(init.headers || {}),
+    },
+  }).catch(() => null);
+  if (!r?.ok) return null;
+  return r.json().catch(() => null);
+}
+
+async function scanSolanaPreCall(url) {
+  const limit = Math.min(Math.max(Number(url.searchParams.get("solLimit") || 20), 1), 20);
+  const minLiquidity = Math.max(Number(url.searchParams.get("solMinLiquidity") || 3000), 0);
+  const maxAgeMinutes = Math.min(Math.max(Number(url.searchParams.get("solMaxAgeMinutes") || 180), 5), 1440);
+
+  // GeckoTerminal's public new-pools feed is used only for discovery.
+  // DexScreener is then used for market/flow confirmation.
+  const gt = await fetchJsonSafe("https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1");
+  const rows = Array.isArray(gt?.data) ? gt.data : [];
+  const now = Date.now();
+  const candidates = [];
+
+  for (const row of rows.slice(0, 30)) {
+    const attrs = row?.attributes || {};
+    const pairAddress = String(attrs?.address || "").trim();
+    if (!pairAddress) continue;
+
+    const created = attrs?.pool_created_at ? new Date(attrs.pool_created_at).getTime() : NaN;
+    const ageMinutes = Number.isFinite(created) ? Math.max(0, (now - created) / 60000) : null;
+    if (ageMinutes !== null && ageMinutes > maxAgeMinutes) continue;
+
+    const ds = await fetchJsonSafe(`https://api.dexscreener.com/latest/dex/pairs/solana/${encodeURIComponent(pairAddress)}`);
+    const pair = Array.isArray(ds?.pairs)
+      ? ds.pairs.find((p) => String(p?.chainId || "").toLowerCase() === "solana")
+      : null;
+    if (!pair) continue;
+
+    const liquidityUsd = Number(pair?.liquidity?.usd || 0);
+    if (liquidityUsd < minLiquidity) continue;
+
+    const base = pair?.baseToken || {};
+    const quote = pair?.quoteToken || {};
+    const candidateContract = String(base?.address || "");
+    if (!candidateContract) continue;
+
+    const simplified = {
+      chainId: "solana",
+      dexId: pair?.dexId || null,
+      pairAddress: pair?.pairAddress || pairAddress,
+      url: pair?.url || null,
+      baseToken: base,
+      quoteToken: quote,
+      priceUsd: Number(pair?.priceUsd || 0) || null,
+      liquidityUsd,
+      fdv: Number(pair?.fdv || 0) || null,
+      marketCap: Number(pair?.marketCap || 0) || null,
+      volume: pair?.volume || {},
+      txns: pair?.txns || {},
+      priceChange: pair?.priceChange || {},
+      pairCreatedAt: pair?.pairCreatedAt || (Number.isFinite(created) ? created : null),
+      signals: solanaPairSignals(pair),
+    };
+
+    const tx5 = txCount(pair?.txns?.m5);
+    candidates.push({
+      network: "Solana",
+      candidateContract,
+      poolAddress: pair?.pairAddress || pairAddress,
+      candidateToken: {
+        address: candidateContract,
+        name: base?.name || null,
+        symbol: base?.symbol || null,
+      },
+      pair: simplified,
+      discovery: {
+        source: "GECKOTERMINAL_NEW_POOLS+DEXSCREENER_CONFIRMATION",
+        newPoolDetected: ageMinutes === null ? true : ageMinutes <= maxAgeMinutes,
+        firstFlowDetected: tx5 > 0,
+        ageMinutes,
+        poolCreatedAt: Number.isFinite(created) ? new Date(created).toISOString() : null,
+      },
+    });
+
+    if (candidates.length >= limit) break;
+  }
+
+  return {
+    service: "SUPER MONSTER SOLANA PRE-CALL",
+    version: "3.2.0",
+    status: gt ? "ONLINE" : "DEGRADED",
+    network: "Solana",
+    candidates,
+    earlyWatch: candidates,
+    checkedAt: new Date().toISOString(),
+    caveat:
+      "Solana discovery uses public new-pool indexing plus DexScreener flow confirmation. It is early-discovery infrastructure, not a complete mempool feed and not a buy signal.",
+  };
+}
+
+function superMonsterCombinedView(rhView, solView) {
+  const rh = Array.isArray(rhView?.candidates) ? rhView.candidates : [];
+  const solRaw = Array.isArray(solView?.candidates) ? solView.candidates : [];
+  const sol = solRaw.map((candidate) => {
+    const precall = preCallScore(candidate);
+    const timing = stampPreCall(candidate);
+    return {
+      ...candidate,
+      superMonster: {
+        ...precall,
+        firstDetection: timing,
+        callConfirmation: {
+          status: "NOT_CONNECTED",
+          note: "Telegram/public-call confirmation remains a separate input; PRE-CALL discovery does not wait for calls.",
+        },
+        smartWallets: {
+          status: "PENDING_WALLET_FEED",
+          note: "Wallet-label attribution is not yet connected.",
+        },
+      },
+    };
+  });
+
+  const combined = [...rh, ...sol].sort(
+    (a, b) => Number(b?.superMonster?.score || 0) - Number(a?.superMonster?.score || 0)
+  );
+
+  return {
+    service: "SUPER MONSTER",
+    version: "3.2.0",
+    status: rhView?.status === "ONLINE" || solView?.status === "ONLINE" ? "ONLINE" : "DEGRADED",
+    networks: ["Robinhood Chain", "Solana"],
+    architecture: ["PRE_CALL", "MONSTER_MOMENTUM", "RADAR_SS", "RADAR", "MONSTER_TRADING"],
+    candidates: combined,
+    strongest: combined.filter((x) => x?.superMonster?.tier === "PRE_CALL_STRONG"),
+    preCall: combined.filter((x) => ["PRE_CALL_STRONG", "PRE_CALL"].includes(x?.superMonster?.tier)),
+    byNetwork: {
+      robinhood: rh,
+      solana: sol,
+    },
+    checkedAt: new Date().toISOString(),
+    note:
+      "Read-only discovery. Robinhood uses on-chain pool/swap discovery; Solana uses public new-pool discovery plus DexScreener confirmation. No trade execution.",
+  };
+}
+
+
+
+// SUPER MONSTER v3.2 — FAST WATCH / IGNITION
+// Read-only. Detects acceleration slope; NEVER auto-buys.
+const fastWatchMemory = new Map();
+const FAST_WATCH_TTL_MS = 2 * 60 * 60 * 1000;
+const FAST_WATCH_MAX_SAMPLES = 12;
+
+function pruneFastWatchMemory() {
+  const cutoff = Date.now() - FAST_WATCH_TTL_MS;
+  for (const [key, v] of fastWatchMemory.entries()) {
+    if (new Date(v?.lastSeenAt || 0).getTime() < cutoff) fastWatchMemory.delete(key);
+  }
+}
+function fastKey(c) {
+  return String(c?.candidateContract || c?.poolAddress || "").toLowerCase();
+}
+function fastSnapshot(c) {
+  const p = c?.pair || {};
+  const tx5 = txCount(p?.txns?.m5);
+  const buys5 = Number(p?.txns?.m5?.buys || 0);
+  const sells5 = Number(p?.txns?.m5?.sells || 0);
+  return {
+    at: new Date().toISOString(),
+    priceUsd: Number(p?.priceUsd || 0) || null,
+    mc: Number(p?.marketCap || p?.fdv || 0) || null,
+    liq: Number(p?.liquidityUsd || p?.liquidity?.usd || 0) || null,
+    vol5: Number(p?.volume?.m5 || 0),
+    tx5, buys5, sells5,
+    buyShare: tx5 > 0 ? buys5 / tx5 : 0,
+    pc5: Number(p?.priceChange?.m5 || 0),
+  };
+}
+function pct(a,b) { a=Number(a||0); b=Number(b||0); return a>0&&b>0 ? (a/b-1)*100 : null; }
+function rat(a,b) { a=Number(a||0); b=Number(b||0); return a>=0&&b>0 ? a/b : null; }
+
+function updateFastWatch(c) {
+  pruneFastWatchMemory();
+  const key=fastKey(c); if(!key) return null;
+  const snap=fastSnapshot(c);
+  const h=fastWatchMemory.get(key)||{firstSeenAt:snap.at,first:snap,samples:[]};
+  h.samples.push(snap); if(h.samples.length>FAST_WATCH_MAX_SAMPLES) h.samples.shift();
+  h.lastSeenAt=snap.at;
+  const prev=h.samples.length>=2?h.samples[h.samples.length-2]:null;
+  h.deltas={
+    mcFromFirstPct:pct(snap.mc,h.first.mc),
+    priceFromFirstPct:pct(snap.priceUsd,h.first.priceUsd),
+    liquidityStepPct:prev?pct(snap.liq,prev.liq):null,
+    volumeSlope:prev?rat(snap.vol5,prev.vol5):null,
+    txSlope:prev?rat(snap.tx5,prev.tx5):null
+  };
+  h.current=snap; fastWatchMemory.set(key,h); return h;
+}
+
+function ignitionScore(c,h) {
+  const p=c?.pair||{}, s=p?.signals||{}, cur=h?.current||fastSnapshot(c), d=h?.deltas||{};
+  const va=Number(s?.volumeAcceleration5mVs1hPace||0), ta=Number(s?.txAcceleration5mVs1hPace||0);
+  const vs=Number(d.volumeSlope||0), ts=Number(d.txSlope||0), bs=Number(cur.buyShare||0);
+  const move=Number(d.mcFromFirstPct ?? d.priceFromFirstPct ?? 0), ls=Number(d.liquidityStepPct||0), pc5=Number(cur.pc5||0);
+  let score=0; const reasons=[];
+  if(va>=2||vs>=1.8){score+=24;reasons.push("VOLUME_SLOPE_STRONG");}
+  else if(va>=1.35||vs>=1.3){score+=15;reasons.push("VOLUME_SLOPE");}
+  if(ta>=1.5||ts>=1.5){score+=18;reasons.push("TX_SLOPE_STRONG");}
+  else if(ta>=1.15||ts>=1.2){score+=10;reasons.push("TX_SLOPE");}
+  if(bs>=0.64&&cur.buys5>=6){score+=18;reasons.push("BUY_PRESSURE_STRONG");}
+  else if(bs>=0.56&&cur.buys5>=4){score+=11;reasons.push("BUY_PRESSURE");}
+  if(ls>=5){score+=12;reasons.push("LIQUIDITY_RISING");}
+  else if(ls>=-3&&Number(cur.liq||0)>=3000){score+=7;reasons.push("LIQUIDITY_STABLE");}
+  else if(ls<=-12){score-=25;reasons.push("LIQUIDITY_DRAIN");}
+  if(move>=5&&move<=35){score+=18;reasons.push("EARLY_BREAKOUT_WINDOW");}
+  else if(move>35&&move<=60){score+=8;reasons.push("LATE_BREAKOUT_WINDOW");}
+  else if(move>80){score-=30;reasons.push("NO_CHASE_FROM_FIRST_DETECTION");}
+  if(pc5>=2&&pc5<=18){score+=10;reasons.push("PRICE_IGNITION");}
+  else if(pc5>25){score-=25;reasons.push("CURRENT_CANDLE_EXTENDED");}
+  if(cur.tx5<4||cur.vol5<500){score-=15;reasons.push("FLOW_TOO_THIN");}
+  score=Math.max(0,Math.min(100,Math.round(score)));
+  let state="WATCH";
+  if(move>80||pc5>25) state="NO_CHASE";
+  else if(score>=70) state="IGNITION";
+  else if(score>=50) state="ARMED";
+  else if(score>=30) state="GESTATING";
+  return {score,state,reasons,firstSeenAt:h?.firstSeenAt||null,firstMarketCap:h?.first?.mc||null,
+    currentMarketCap:cur.mc||null,moveFromFirstPct:Number.isFinite(move)?move:null,
+    metrics:{liquidityUsd:cur.liq,volume5m:cur.vol5,tx5m:cur.tx5,buys5m:cur.buys5,sells5m:cur.sells5,
+      buyShare5m:bs,volumeSlope:Number.isFinite(vs)?vs:null,txSlope:Number.isFinite(ts)?ts:null,
+      volumeAccelerationVs1hPace:va,txAccelerationVs1hPace:ta,liquidityStepPct:ls,priceChange5mPct:pc5}};
+}
+function applyFastWatch(result) {
+  const enriched=(Array.isArray(result?.candidates)?result.candidates:[]).map(c=>{
+    const h=updateFastWatch(c), fw=ignitionScore(c,h);
+    return {...c,superMonster:{...(c.superMonster||{}),fastWatch:fw}};
+  }).sort((a,b)=>Number(b?.superMonster?.fastWatch?.score||0)-Number(a?.superMonster?.fastWatch?.score||0));
+  return {...result,version:"3.2.0",candidates:enriched,
+    ignition:enriched.filter(x=>x?.superMonster?.fastWatch?.state==="IGNITION"),
+    armed:enriched.filter(x=>x?.superMonster?.fastWatch?.state==="ARMED"),
+    noChase:enriched.filter(x=>x?.superMonster?.fastWatch?.state==="NO_CHASE"),
+    fastWatchPolicy:{objective:"Detect slope before extension; never auto-buy.",ignitionScore:70,armedScore:50,
+      noChaseFromFirstDetectionPct:80,currentCandleExtendedPct:25}};
+}
+
+async function runSuperMonster(env, url) {
+  const [rhScan, solScan] = await Promise.all([scanMomentum(env, url), scanSolanaPreCall(url)]);
+  const rhView = superMonsterView(rhScan);
+  return applyFastWatch(superMonsterCombinedView(rhView, solScan));
+}
+
+async function maybeSendSuperMonsterAlert(env, result) {
+  if (!env.SUPER_MONSTER_WEBHOOK_URL) return { sent: false, reason: "NO_WEBHOOK_CONFIGURED" };
+  const ignition = Array.isArray(result?.ignition) ? result.ignition : [];
+  const strongest = Array.isArray(result?.strongest) ? result.strongest : [];
+  const alertCandidates = ignition.length ? ignition : strongest;
+  if (!alertCandidates.length) return { sent: false, reason: "NO_IGNITION_OR_STRONG_PRECALL" };
+
+  const payload = {
+    event: ignition.length ? "SUPER_MONSTER_IGNITION" : "SUPER_MONSTER_PRECALL",
+    networks: result.networks || [result.network].filter(Boolean),
+    checkedAt: result.checkedAt,
+    candidates: alertCandidates.slice(0, 5).map((x) => ({
+      network: x.network || "Robinhood Chain",
+      contract: x.candidateContract,
+      pool: x.poolAddress,
+      score: x.superMonster?.score,
+      tier: x.superMonster?.tier,
+      reasons: x.superMonster?.reasons,
+      fastWatch: x.superMonster?.fastWatch,
+      firstDetection: x.superMonster?.firstDetection,
+      market: x.pair,
+    })),
+  };
+
+  const r = await fetch(env.SUPER_MONSTER_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  }).catch(() => null);
+
+  return {
+    sent: Boolean(r?.ok),
+    status: r?.status || null,
+    reason: r?.ok ? "SENT" : "WEBHOOK_FAILED",
   };
 }
 
@@ -1947,7 +2441,7 @@ async function scanMomentum(env, url) {
 
   return {
     service: "MONSTER LIVE FEED",
-    version: "2.4.1",
+    version: "3.2.0",
     status: "ONLINE",
     network: "Robinhood Chain",
     chainId: EXPECTED_CHAIN_ID,
@@ -2013,9 +2507,9 @@ export default {
 
         return json({
           service: "MONSTER LIVE FEED",
-          version: "2.4.1",
+          version: "3.2.0",
           status: chainId === EXPECTED_CHAIN_ID ? "ONLINE" : "WRONG_NETWORK",
-          network: "Robinhood Chain",
+          network: "Robinhood Chain + Solana",
           blockNumber: hexToNumber(blockHex),
           chainIdHex,
           chainId,
@@ -2024,6 +2518,8 @@ export default {
           endpoints: {
             health: "/health",
             scan: "/scan?blocks=100&limit=12&minLiquidity=1000&earlyReserve=4&sizeUsd=200",
+            precall: "/precall?blocks=100&limit=20&minLiquidity=1000&earlyReserve=8&sizeUsd=200",
+            superMonster: "/supermonster?blocks=100&limit=20&minLiquidity=1000&earlyReserve=8&sizeUsd=200&solLimit=20&solMinLiquidity=3000&solMaxAgeMinutes=180",
             guard:
               "/guard/0x...?pool=0x...&sizeUsd=200&samples=3&delayMs=2000 (pool may be V2/V3 address or V4 bytes32 poolId)",
             token: "/token/0x...",
@@ -2033,6 +2529,14 @@ export default {
           note:
             "Read-only feed. No private keys, signing, swaps, or transaction execution.",
         });
+      }
+
+      if (url.pathname === "/precall" || url.pathname === "/supermonster") {
+        // Defaults favor early discovery; query params can still override them.
+        if (!url.searchParams.has("limit")) url.searchParams.set("limit", "20");
+        if (!url.searchParams.has("earlyReserve")) url.searchParams.set("earlyReserve", "8");
+        const result = await runSuperMonster(env, url);
+        return json(result, 200, 5);
       }
 
       if (url.pathname === "/scan") {
@@ -2137,5 +2641,41 @@ export default {
         500
       );
     }
+  },
+
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const url = new URL(
+            "https://super-monster.internal/supermonster?blocks=100&limit=20&minLiquidity=1000&earlyReserve=8&sizeUsd=200&solLimit=20&solMinLiquidity=3000&solMaxAgeMinutes=180"
+          );
+          const result = await runSuperMonster(env, url);
+          const alert = await maybeSendSuperMonsterAlert(env, result);
+          console.log(
+            JSON.stringify({
+              service: "SUPER MONSTER CRON",
+              scheduledTime: controller?.scheduledTime || Date.now(),
+              checkedAt: result.checkedAt,
+              candidates: result.candidates?.length || 0,
+              strongest: result.strongest?.length || 0,
+              armed: result.armed?.length || 0,
+              ignition: result.ignition?.length || 0,
+              noChase: result.noChase?.length || 0,
+              alert,
+            })
+          );
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              service: "SUPER MONSTER CRON",
+              status: "ERROR",
+              message: error?.message || String(error),
+              at: new Date().toISOString(),
+            })
+          );
+        }
+      })()
+    );
   },
 };
